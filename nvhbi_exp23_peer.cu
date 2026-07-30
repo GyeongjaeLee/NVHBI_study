@@ -467,7 +467,19 @@ int main(int argc, char** argv) {
 
             CHECK_CUDA(cudaSetDevice(0));
             CHECK_CUDA(cudaMemcpy(&bg_p1, d_bg_prog, sizeof(bg_p1), cudaMemcpyDeviceToHost));
-            if (bg_sms) { nvhbi_stop_flag_set(stop); CHECK_CUDA(cudaStreamSynchronize(s_bg)); }
+            unsigned long long bg_cyc = 0ull;
+            if (bg_sms) {
+                nvhbi_stop_flag_set(stop);
+                CHECK_CUDA(cudaStreamSynchronize(s_bg));
+                CHECK_CUDA(cudaMemcpy(&bg_cyc, d_bg_cyc, sizeof(bg_cyc),
+                                      cudaMemcpyDeviceToHost));
+            }
+            // Clock the background actually achieved. It is stopped early by the
+            // flag, so the span is from launch to the stop, not the full deadline:
+            // settle + the measurement window.
+            const double bg_span_ms = 100.0 + wall_ms;
+            const double bg_ghz = (bg_sms && bg_cyc)
+                ? (double)bg_cyc / (bg_span_ms * 1e6) : 0.0;
 
             const double bg_alive_ms = (double)(4u * window_ms + 2000u) - 100.0;
             if (bg_sms && wall_ms > bg_alive_ms)
