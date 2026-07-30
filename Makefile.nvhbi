@@ -1,0 +1,33 @@
+# Makefile.nvhbi -- builds the NV-HBI bisection study binaries.
+#   make -f Makefile.nvhbi            # exp1 + exp2/3
+#   make -f Makefile.nvhbi nccl       # exp4 (needs NCCL headers/libs)
+#   make -f Makefile.nvhbi ARCH=100   # sm_100 = Blackwell (default)
+
+NVCC ?= nvcc
+ARCH ?= 100
+
+NVCCFLAGS ?= -O3 -std=c++14 \
+             -Xptxas -dlcm=ca -Xptxas -dscm=cg \
+             -gencode arch=compute_$(ARCH),code=sm_$(ARCH)
+
+# Set NCCL_HOME if NCCL is not on the default include/library path.
+NCCL_HOME ?=
+NCCL_INC := $(if $(NCCL_HOME),-I$(NCCL_HOME)/include,)
+NCCL_LIB := $(if $(NCCL_HOME),-L$(NCCL_HOME)/lib,) -lnccl
+
+BINS      := nvhbi_exp1_bisection nvhbi_exp23_peer
+NCCL_BIN  := nvhbi_exp4_nccl
+
+.PHONY: all nccl clean
+
+all: $(BINS)
+nccl: $(NCCL_BIN)
+
+$(BINS): %: %.cu nvhbi_common.cuh
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
+$(NCCL_BIN): $(NCCL_BIN).cu nvhbi_common.cuh
+	$(NVCC) $(NVCCFLAGS) $(NCCL_INC) -o $@ $< $(NCCL_LIB)
+
+clean:
+	rm -f $(BINS) $(NCCL_BIN)
