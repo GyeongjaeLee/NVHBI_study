@@ -73,6 +73,14 @@ __device__ __forceinline__ unsigned int nvhbi_ld(const unsigned int* addr) {
     return v;
 }
 
+// clock64() with a memory clobber. Plain clock64() is free to be scheduled
+// across memory operations, which is fatal for latency timing.
+__device__ __forceinline__ unsigned long long nvhbi_clock() {
+    unsigned long long c;
+    asm volatile("mov.u64 %0, %%clock64;" : "=l"(c) :: "memory");
+    return c;
+}
+
 // Lane -> address mapping inside one 4KiB chunk.
 //
 //   lane = 0..31,  main = lane/4,  sub = lane%4
@@ -415,24 +423,30 @@ __global__ void nvhbi_peer_latency(unsigned int* __restrict__ peer_data,
             v += atomicAdd(&peer_data[idx_list[first + c]], 1u);
     }
 
-    // Small working set x many reps, so the lines stay resident and what is left
-    // is the fabric round trip. `min` is the uncontended figure and is far more
-    // robust than a single pass; `mean` exposes how noisy the link was.
+    // Time a dependency CHAIN, not one access at a time. The previous version
+    // stamped the clock around a single atomic and tried to force completion
+    // with asm volatile("" :: "r"(got)) -- but an empty asm emits no
+    // instruction, so ptxas had nothing to hang a scoreboard wait on, and the
+    // real consumer (v = got) sat after the second stamp. It timed the atomic's
+    // ISSUE and reported 26 cycles, which is register-level, not a memory round
+    // trip.
+    //
+    // Here each atomic's return value feeds the next address, so the hardware
+    // cannot overlap them, and nchunks accesses are timed together so the clock
+    // overhead is amortized away.
 #pragma unroll 1
     for (unsigned int r = 0; r < reps; ++r) {
+        const unsigned long long t0 = nvhbi_clock();
 #pragma unroll 1
         for (unsigned int c = 0; c < nchunks; ++c) {
             unsigned int* p = &peer_data[idx_list[first + c] + (v & 31u)];
-            unsigned long long t0 = clock64();
-            unsigned int got = atomicAdd(p, 1u);
-            asm volatile("" :: "r"(got));      // force the value before the stamp
-            unsigned long long t1 = clock64();
-            v = got;
-            unsigned int dt = (unsigned int)(t1 - t0);
-            if (dt < best) best = dt;
-            acc += dt;
-            ++n;
+            v = atomicAdd(p, 1u);          // result feeds the next address
         }
+        const unsigned long long t1 = nvhbi_clock();
+        const unsigned int per = (unsigned int)((t1 - t0) / nchunks);
+        if (per < best) best = per;
+        acc += per;
+        ++n;
     }
     *out_min  = best;
     *out_mean = (unsigned int)(acc / (n ? n : 1u));

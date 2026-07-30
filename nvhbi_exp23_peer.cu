@@ -146,6 +146,24 @@ int main(int argc, char** argv) {
        ===================================================================== */
     unsigned int* d_lat2 = nullptr;
     CHECK_CUDA(cudaMalloc(&d_lat2, sizeof(unsigned int)));
+
+    // A GPU1-LOCAL reference, measured with the identical kernel. It is the
+    // sanity check on the timer itself: a local atomic must land in the few
+    // hundred cycles an L2 round trip costs. If this reads tens of cycles the
+    // timing is broken, not the fabric, and the peer numbers mean nothing.
+    unsigned int* d_local_buf = nullptr;
+    unsigned int* d_local_idx = nullptr;
+    {
+        const unsigned int nloc = 64u;
+        CHECK_CUDA(cudaMalloc(&d_local_buf, (size_t)nloc * NVHBI_CHUNK_BYTES));
+        CHECK_CUDA(cudaMemset(d_local_buf, 0x5a, (size_t)nloc * NVHBI_CHUNK_BYTES));
+        unsigned int* h = (unsigned int*)malloc(nloc * sizeof(unsigned int));
+        for (unsigned int i = 0; i < nloc; ++i) h[i] = i * NVHBI_CHUNK_INTS;
+        CHECK_CUDA(cudaMalloc(&d_local_idx, nloc * sizeof(unsigned int)));
+        CHECK_CUDA(cudaMemcpy(d_local_idx, h, nloc * sizeof(unsigned int),
+                              cudaMemcpyHostToDevice));
+        free(h);
+    }
     const unsigned int lat_chunks = env_u("NVHBI_LAT_CHUNKS", 16u);
     const unsigned int lat_reps   = env_u("NVHBI_LAT_REPS", 200u);
     const unsigned int lat_warm   = env_u("NVHBI_LAT_WARMUP", 64u);
@@ -160,6 +178,21 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaMemcpy(mn, d_lat,  sizeof(unsigned int), cudaMemcpyDeviceToHost));
         CHECK_CUDA(cudaMemcpy(me, d_lat2, sizeof(unsigned int), cudaMemcpyDeviceToHost));
     };
+
+    unsigned int lat_loc = ~0u, mean_loc = 0u;
+    {
+        unsigned int mn, me;
+        for (unsigned int r = 0; r < 2u; ++r) {
+            nvhbi_peer_latency<<<1, 1>>>(d_local_buf, d_local_idx, 0u, lat_chunks,
+                                         lat_reps, lat_warm, d_lat, d_lat2, d_sink1);
+            CHECK_CUDA(cudaGetLastError());
+            CHECK_CUDA(cudaDeviceSynchronize());
+            CHECK_CUDA(cudaMemcpy(&mn, d_lat,  sizeof(mn), cudaMemcpyDeviceToHost));
+            CHECK_CUDA(cudaMemcpy(&me, d_lat2, sizeof(me), cudaMemcpyDeviceToHost));
+            if (mn < lat_loc) lat_loc = mn;
+            mean_loc = me;
+        }
+    }
 
     unsigned int lat0 = ~0u, lat1 = ~0u, mean0 = 0u, mean1 = 0u;
     {
@@ -222,6 +255,7 @@ int main(int argc, char** argv) {
     printf("\n================ CALIBRATION ================\n");
     printf("peer atomic latency (min over %u chunks x %u reps x %u rounds)\n",
            lat_chunks, lat_reps, lat_rounds);
+    printf("  GPU1 local (reference): min=%u cyc  mean=%u cyc\n", lat_loc, mean_loc);
     printf("  die0: min=%u cyc  mean=%u cyc\n", lat0, mean0);
     printf("  die1: min=%u cyc  mean=%u cyc\n", lat1, mean1);
     printf("  gap : %d cyc\n", (int)lat1 - (int)lat0);
@@ -229,6 +263,14 @@ int main(int argc, char** argv) {
     printf("=> NEAR die (NVLink-attached) = die%u\n", near_die);
     printf("   FAR  die (extra NV-HBI hop) = die%u   [%s]\n", far_die, how);
     {
+        if (lat_loc < 100u)
+            printf("   *** WARNING: the GPU1-local reference is only %u cycles. A local\n"
+                   "       atomic cannot be that fast -- the TIMER is broken, so every\n"
+                   "       latency above is meaningless. ***\n", lat_loc);
+        else if (lat0 < lat_loc || lat1 < lat_loc)
+            printf("   *** WARNING: a peer latency came in below the local reference\n"
+                   "       (%u cyc). Peer access cannot beat local; suspect the timer. ***\n",
+                   lat_loc);
         const int gap = (int)((lat0 > lat1) ? lat0 - lat1 : lat1 - lat0);
         if (gap < 50)
             printf("   *** WARNING: gap is only %d cycles. The two dies are not\n"
