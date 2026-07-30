@@ -362,6 +362,13 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaStreamCreateWithFlags(&s_bg, cudaStreamNonBlocking));
     unsigned long long* d_bg_prog = nullptr;
     CHECK_CUDA(cudaMalloc(&d_bg_prog, sizeof(unsigned long long)));
+    // The background's achieved SM clock. exp1 measured 83.8 GB/s per SM at
+    // 1.22 GHz; this experiment sees 62.8, exactly 0.75x at every SM count. A
+    // flat ratio like that is a clock difference, not a structural one -- and
+    // exp2's background runs for seconds, so it throttles where exp1's 20-30 ms
+    // kernels did not. Without this column the two cannot be compared.
+    unsigned long long* d_bg_cyc = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_bg_cyc, sizeof(unsigned long long)));
     NvhbiStopFlag stop;
     nvhbi_stop_flag_create(stop);
 
@@ -369,7 +376,7 @@ int main(int argc, char** argv) {
     const unsigned int  peer_block = 128u;
 
     printf("# CFG,exp,far_die,peer_die,bg_local,bg_sms,peer_blocks,rep,"
-           "peer_ms,peer_GBps,bg_GBps,crossing_GBps\n");
+           "peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz\n");
 
     for (int bi = 0; bi < bg_n; ++bi) {
     for (int pi = 0; pi < pk_n; ++pi) {
@@ -398,6 +405,7 @@ int main(int argc, char** argv) {
 
             /* start background, settle */
             CHECK_CUDA(cudaMemset(d_bg_prog, 0, sizeof(unsigned long long)));
+            CHECK_CUDA(cudaMemset(d_bg_cyc, 0, sizeof(unsigned long long)));
             nvhbi_stop_flag_reset(stop);
             if (bg_sms) {
                 // Must outlast settle + the whole peer kernel, or the counter
@@ -410,7 +418,7 @@ int main(int argc, char** argv) {
                     t.d_data, t.d_far_idx, t.d_near_idx, t.d_sm_side,
                     bg_writer_partition, bg_local, bg_sms, bg_nbps,
                     (unsigned int)t.sm_count, bg_lines, 0u,
-                    0u, dl, stop.d, d_bg_prog, nullptr, t.d_sink);
+                    0u, dl, stop.d, d_bg_prog, d_bg_cyc, t.d_sink);
                 CHECK_CUDA(cudaGetLastError());
                 spin_ms(100.0);
             }
@@ -473,9 +481,9 @@ int main(int argc, char** argv) {
             const double crossing = (bg_local ? 0.0 : bg_gbps)
                                   + ((exp == 2u) ? peer_gbps : 0.0);
 
-            printf("CFG,%u,%u,%u,%u,%u,%u,%u,%.4f,%.2f,%.2f,%.2f\n",
+            printf("CFG,%u,%u,%u,%u,%u,%u,%u,%.4f,%.2f,%.2f,%.2f,%.3f\n",
                    exp, far_die, peer_die, bg_local, bg_sms, pb, rep,
-                   peer_ms, peer_gbps, bg_gbps, crossing);
+                   peer_ms, peer_gbps, bg_gbps, crossing, bg_ghz);
             fflush(stdout);
         }
     }}
@@ -510,6 +518,7 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaFree(d_peer_prog));
     CHECK_CUDA(cudaSetDevice(0));
     CHECK_CUDA(cudaStreamDestroy(s_bg)); CHECK_CUDA(cudaFree(d_bg_prog));
+    CHECK_CUDA(cudaFree(d_bg_cyc));
     nvhbi_stop_flag_destroy(stop);
     nvhbi_free(t);
     return 0;

@@ -37,8 +37,8 @@ PROG="nvhbi_exp23_peer"
 CSV_OUT="${CSV_OUT:-exp23_peer.csv}"
 LOG_OUT="${LOG_OUT:-exp23_peer.log}"
 WHICH="${1:-both}"
-CFG_FIELDS=11
-CFG_HEADER="exp,far_die,peer_die,bg_local,bg_sms,peer_blocks,rep,peer_ms,peer_GBps,bg_GBps,crossing_GBps"
+CFG_FIELDS=12
+CFG_HEADER="exp,far_die,peer_die,bg_local,bg_sms,peer_blocks,rep,peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz"
 
 ndev=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d ' ')
 if [[ "$ndev" -lt 2 ]]; then
