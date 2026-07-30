@@ -6,7 +6,8 @@
 NVCC ?= nvcc
 ARCH ?= 100
 
-NVCCFLAGS ?= -O3 -std=c++14 \
+EXTRA_FLAGS ?=
+NVCCFLAGS ?= $(EXTRA_FLAGS) -O3 -std=c++14 \
              -Xptxas -dlcm=ca -Xptxas -dscm=cg \
              -gencode arch=compute_$(ARCH),code=sm_$(ARCH)
 

@@ -50,6 +50,14 @@
     }                                                                          \
 } while (0)
 
+// How often the deadline loop stops to poll. Overridable so the cost of the
+// poll itself can be measured: -DNVHBI_POLL_MASK=65535u polls 64x less often.
+// exp1 (fixed-iteration branch, no poll at all) reaches 83.6 GB/s per SM where
+// this branch reaches 62.8, and the poll is the only difference in the loop.
+#ifndef NVHBI_POLL_MASK
+#define NVHBI_POLL_MASK 1023u
+#endif
+
 #define NVHBI_CHUNK_INTS  1024u          // 4KiB working/probing chunk
 #define NVHBI_CHUNK_BYTES (NVHBI_CHUNK_INTS * 4u)
 
@@ -312,7 +320,7 @@ __global__ void nvhbi_stress_write(unsigned int* __restrict__ data,
             // should reach ~4750). stop_flag now lives in device memory and the
             // interval is 1024 iterations, which still leaves ~50 progress
             // samples per 200 ms window.
-            if ((it & 1023u) == 1023u) {
+            if ((it & NVHBI_POLL_MASK) == NVHBI_POLL_MASK) {
                 if (progress && lane == 0u) { atomicAdd(progress, done * lanes); done = 0ull; }
                 if ((unsigned long long)(clock64() - t0) > deadline_cycles) break;
                 if (stop_flag && *(volatile const unsigned int*)stop_flag) break;

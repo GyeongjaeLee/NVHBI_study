@@ -375,6 +375,51 @@ int main(int argc, char** argv) {
     const unsigned int* d_peer_idx = die_list1(peer_die);   // GPU1-side list for the target die
     const unsigned int  peer_block = 128u;
 
+    // Time-resolved trace of the background alone. exp1 measures over ms 8-25 of
+    // a 25 ms kernel; this experiment samples ms 100-300 of a 300 ms one. If the
+    // rate decays with time, the two are not measuring the same thing and that
+    // alone explains the 33% gap.
+    if (env_u("NVHBI_BG_TRACE", 0u)) {
+        const unsigned int trace_ms = env_u("NVHBI_BG_TRACE_MS", 1000u);
+        const unsigned int step_ms  = env_u("NVHBI_BG_TRACE_STEP", 50u);
+        const unsigned int tsms     = (bg_max ? bg_max : bg_sms_max);
+        const unsigned int tchunks  = nvhbi_chunks_used(tsms, bg_nbps, bg_block, bg_lines);
+        CHECK_CUDA(cudaSetDevice(0));
+        nvhbi_flush_l2(t);
+        nvhbi_warm_chunks<<<t.sm_count * 8, 128>>>(
+            t.d_data, (bg_target_die == 1u) ? t.d_far_idx : t.d_near_idx,
+            0u, tchunks, t.d_sm_side, bg_target_die, t.d_sink);
+        CHECK_CUDA(cudaDeviceSynchronize());
+        CHECK_CUDA(cudaMemset(d_bg_prog, 0, sizeof(unsigned long long)));
+        nvhbi_stop_flag_reset(stop);
+        const unsigned long long dl =
+            (unsigned long long)(trace_ms + 2000u) * (unsigned long long)t.clock_khz;
+        nvhbi_stress_write<<<t.sm_count * bg_nbps, bg_block, 0, s_bg>>>(
+            t.d_data, t.d_far_idx, t.d_near_idx, t.d_sm_side,
+            bg_writer_partition, bg_local, tsms, bg_nbps,
+            (unsigned int)t.sm_count, bg_lines, 0u,
+            0u, dl, stop.d, d_bg_prog, d_bg_cyc, t.d_sink);
+        CHECK_CUDA(cudaGetLastError());
+        printf("# TRACE,t_ms,interval_GBps   (background alone, %u SMs)\n", tsms);
+        unsigned long long prev = 0ull;
+        const double t_start = now_ms();
+        double next = t_start + (double)step_ms;
+        while (now_ms() - t_start < (double)trace_ms) {
+            while (now_ms() < next) { }
+            const double now = now_ms();
+            unsigned long long cur = 0ull;
+            CHECK_CUDA(cudaMemcpy(&cur, d_bg_prog, sizeof(cur), cudaMemcpyDeviceToHost));
+            printf("TRACE,%.0f,%.1f\n", now - t_start,
+                   (double)(cur - prev) * 32.0 / (step_ms * 1e-3) / 1e9);
+            fflush(stdout);
+            prev = cur;
+            next += (double)step_ms;
+        }
+        nvhbi_stop_flag_set(stop);
+        CHECK_CUDA(cudaStreamSynchronize(s_bg));
+        printf("\n");
+    }
+
     printf("# CFG,exp,far_die,peer_die,bg_local,bg_sms,peer_blocks,rep,"
            "peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz\n");
 
