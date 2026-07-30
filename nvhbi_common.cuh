@@ -543,7 +543,7 @@ static void nvhbi_probe(NvhbiTopo& t, int device, double buf_mult, bool verbose 
     unsigned int* h_side = (unsigned int*)calloc(t.sm_count, sizeof(unsigned int));
     unsigned int n0 = 0, n1 = 1;
     for (int i = 0; i < t.sm_count; ++i) {
-        if (std::abs((long long)h_lat[i] - (long long)h_lat[0]) < 50) { h_side[i] = n0; n0 += 2; }
+        if (std::abs((long long)h_lat[i] - (long long)h_lat[0]) < 100) { h_side[i] = n0; n0 += 2; }
         else                                                          { h_side[i] = n1; n1 += 2; }
     }
     t.sms_p0 = n0 / 2u;
