@@ -397,10 +397,15 @@ __global__ void nvhbi_peer_latency(unsigned int* __restrict__ peer_data,
                                    unsigned int nchunks,
                                    unsigned int reps,
                                    unsigned int warmup,
+                                   unsigned int probe_smid,
                                    unsigned int* __restrict__ out_min,
                                    unsigned int* __restrict__ out_mean,
                                    unsigned int* __restrict__ sink) {
-    if (threadIdx.x != 0 || blockIdx.x != 0 || nchunks == 0u) return;
+    // Pin the probe to a named SM. The issuing GPU is itself two dies, so an SM
+    // on its far die crosses that GPU's OWN NV-HBI before reaching NVLink.
+    // Leaving placement to the scheduler made the calibration irreproducible and
+    // mixed that hop into the result.
+    if (nvhbi_smid() != probe_smid || threadIdx.x != 0 || nchunks == 0u) return;
 
     // Time an ATOMIC, not a plain load. An atomic has to travel to the line's
     // home L2 slice every single time, so no local copy on this GPU can serve it

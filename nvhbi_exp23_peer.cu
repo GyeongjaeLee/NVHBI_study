@@ -169,22 +169,35 @@ int main(int argc, char** argv) {
     const unsigned int lat_warm   = env_u("NVHBI_LAT_WARMUP", 64u);
     const unsigned int lat_rounds = env_u("NVHBI_LAT_ROUNDS", 4u);
 
-    auto peer_latency_once = [&](unsigned int die, unsigned int* mn, unsigned int* me) {
+    // Two GPU1 SMs far apart in the id space, so they most likely sit on
+    // different GPU1 dies. Probing both against both GPU0 dies gives a 2x2:
+    // the spread across GPU0 dies is GPU0's hop, the spread across GPU1 SMs is
+    // GPU1's own hop.
+    const unsigned int smA = 0u;
+    const unsigned int smB = (unsigned int)prop1.multiProcessorCount - 1u;
+
+    auto peer_latency_sm = [&](unsigned int die, unsigned int psm,
+                               unsigned int* mn, unsigned int* me) {
         const unsigned int nc = (die_count(die) < lat_chunks) ? die_count(die) : lat_chunks;
-        nvhbi_peer_latency<<<1, 1>>>(t.d_data, die_list1(die), 0u, nc,
-                                     lat_reps, lat_warm, d_lat, d_lat2, d_sink1);
+        nvhbi_peer_latency<<<prop1.multiProcessorCount, 1>>>(
+                                     t.d_data, die_list1(die), 0u, nc,
+                                     lat_reps, lat_warm, psm, d_lat, d_lat2, d_sink1);
         CHECK_CUDA(cudaGetLastError());
         CHECK_CUDA(cudaDeviceSynchronize());
         CHECK_CUDA(cudaMemcpy(mn, d_lat,  sizeof(unsigned int), cudaMemcpyDeviceToHost));
         CHECK_CUDA(cudaMemcpy(me, d_lat2, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    };
+    auto peer_latency_once = [&](unsigned int die, unsigned int* mn, unsigned int* me) {
+        peer_latency_sm(die, smA, mn, me);
     };
 
     unsigned int lat_loc = ~0u, mean_loc = 0u;
     {
         unsigned int mn, me;
         for (unsigned int r = 0; r < 2u; ++r) {
-            nvhbi_peer_latency<<<1, 1>>>(d_local_buf, d_local_idx, 0u, lat_chunks,
-                                         lat_reps, lat_warm, d_lat, d_lat2, d_sink1);
+            nvhbi_peer_latency<<<prop1.multiProcessorCount, 1>>>(
+                                         d_local_buf, d_local_idx, 0u, lat_chunks,
+                                         lat_reps, lat_warm, smA, d_lat, d_lat2, d_sink1);
             CHECK_CUDA(cudaGetLastError());
             CHECK_CUDA(cudaDeviceSynchronize());
             CHECK_CUDA(cudaMemcpy(&mn, d_lat,  sizeof(mn), cudaMemcpyDeviceToHost));
@@ -239,6 +252,17 @@ int main(int argc, char** argv) {
     const double bw0 = peer_bw(0u);
     const double bw1 = peer_bw(1u);
 
+    // 2x2: does the ISSUING GPU's die matter too?
+    unsigned int m2[2][2];   // [gpu1 sm A/B][gpu0 die]
+    {
+        unsigned int mn, me;
+        for (int a = 0; a < 2; ++a)
+            for (unsigned int d = 0; d < 2u; ++d) {
+                peer_latency_sm(d, a ? smB : smA, &mn, &me);
+                m2[a][d] = mn;
+            }
+    }
+
     /* -------- decide NEAR (A) / FAR (B) -------- */
     unsigned int far_die;
     const char* how;
@@ -259,6 +283,14 @@ int main(int argc, char** argv) {
     printf("  die0: min=%u cyc  mean=%u cyc\n", lat0, mean0);
     printf("  die1: min=%u cyc  mean=%u cyc\n", lat1, mean1);
     printf("  gap : %d cyc\n", (int)lat1 - (int)lat0);
+    printf("  2x2 min latency (issuing GPU1 SM x target GPU0 die):\n");
+    printf("             GPU0 die0   GPU0 die1   | GPU0 hop\n");
+    printf("    GPU1 SM%-3u  %6u      %6u     | %+5d\n", smA, m2[0][0], m2[0][1],
+           (int)m2[0][1] - (int)m2[0][0]);
+    printf("    GPU1 SM%-3u  %6u      %6u     | %+5d\n", smB, m2[1][0], m2[1][1],
+           (int)m2[1][1] - (int)m2[1][0]);
+    printf("    GPU1 hop    %+5d       %+5d\n",
+           (int)m2[1][0] - (int)m2[0][0], (int)m2[1][1] - (int)m2[0][1]);
     printf("peer WRITE bw      : die0=%.1f GB/s, die1=%.1f GB/s\n", bw0, bw1);
     printf("=> NEAR die (NVLink-attached) = die%u\n", near_die);
     printf("   FAR  die (extra NV-HBI hop) = die%u   [%s]\n", far_die, how);
