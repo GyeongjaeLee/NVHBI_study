@@ -192,7 +192,7 @@ int main() {
 
             /* ---- start background, settle ---- */
             CHECK_CUDA(cudaMemset(d_bg_prog, 0, sizeof(unsigned long long)));
-            *stop.h = 0u;
+            nvhbi_stop_flag_reset(stop);
             if (bg_sms) {
                 const unsigned long long dl =
                     (unsigned long long)60000u * (unsigned long long)t.clock_khz;

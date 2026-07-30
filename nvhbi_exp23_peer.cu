@@ -92,7 +92,7 @@ int main(int argc, char** argv) {
 
     unsigned int bg_list[32], pk_list[32];
     const int bg_n = parse_list("NVHBI_BG_SMS_LIST", "0,16,32,64,74", bg_list, 32);
-    const int pk_n = parse_list("NVHBI_PEER_BLOCKS_LIST", "0,256,1024,4096,16384", pk_list, 32);
+    const int pk_n = parse_list("NVHBI_PEER_BLOCKS_LIST", "0,16,64,256,1024", pk_list, 32);
 
     int ndev = 0;
     CHECK_CUDA(cudaGetDeviceCount(&ndev));
@@ -135,19 +135,49 @@ int main(int argc, char** argv) {
     auto die_count = [&](unsigned int die) { return (die == 1u) ? t.far_count : t.near_count; };
 
     /* =====================================================================
-       CALIBRATION 1: cold peer READ latency to each die (attachment probe)
+       CALIBRATION 1: peer atomic latency to each die (attachment probe)
+
+       Times an ATOMIC on a small resident working set, repeated, after a warm-up
+       pass, and takes the minimum -- see nvhbi_peer_latency. The dies are probed
+       in ALTERNATING order across several rounds so that first-touch cost cannot
+       land on whichever die happens to go first. The earlier cold single-pass
+       version reported a 3.9x gap (13429 vs 3465 cycles) that was mostly
+       measurement order: an NV-HBI hop costs ~300 cycles, not ~10000.
        ===================================================================== */
-    auto peer_latency = [&](unsigned int die) -> unsigned int {
-        unsigned int v = 0;
-        nvhbi_peer_latency<<<1, 1>>>(t.d_data, die_list1(die), 0u,
-                                     (die_count(die) < 512u) ? die_count(die) : 512u,
-                                     d_lat, d_sink1);
+    unsigned int* d_lat2 = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_lat2, sizeof(unsigned int)));
+    const unsigned int lat_chunks = env_u("NVHBI_LAT_CHUNKS", 16u);
+    const unsigned int lat_reps   = env_u("NVHBI_LAT_REPS", 200u);
+    const unsigned int lat_warm   = env_u("NVHBI_LAT_WARMUP", 64u);
+    const unsigned int lat_rounds = env_u("NVHBI_LAT_ROUNDS", 4u);
+
+    auto peer_latency_once = [&](unsigned int die, unsigned int* mn, unsigned int* me) {
+        const unsigned int nc = (die_count(die) < lat_chunks) ? die_count(die) : lat_chunks;
+        nvhbi_peer_latency<<<1, 1>>>(t.d_data, die_list1(die), 0u, nc,
+                                     lat_reps, lat_warm, d_lat, d_lat2, d_sink1);
+        CHECK_CUDA(cudaGetLastError());
         CHECK_CUDA(cudaDeviceSynchronize());
-        CHECK_CUDA(cudaMemcpy(&v, d_lat, sizeof(v), cudaMemcpyDeviceToHost));
-        return v;
+        CHECK_CUDA(cudaMemcpy(mn, d_lat,  sizeof(unsigned int), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(me, d_lat2, sizeof(unsigned int), cudaMemcpyDeviceToHost));
     };
-    const unsigned int lat0 = peer_latency(0u);
-    const unsigned int lat1 = peer_latency(1u);
+
+    unsigned int lat0 = ~0u, lat1 = ~0u, mean0 = 0u, mean1 = 0u;
+    {
+        unsigned int mn, me;
+        peer_latency_once(0u, &mn, &me);   // discarded: pays peer-mapping setup
+        peer_latency_once(1u, &mn, &me);
+        for (unsigned int round = 0; round < lat_rounds; ++round) {
+            // alternate which die goes first
+            const unsigned int a0 = (round & 1u) ? 1u : 0u;
+            const unsigned int a1 = 1u - a0;
+            peer_latency_once(a0, &mn, &me);
+            if (a0 == 0u) { if (mn < lat0) lat0 = mn; mean0 = me; }
+            else          { if (mn < lat1) lat1 = mn; mean1 = me; }
+            peer_latency_once(a1, &mn, &me);
+            if (a1 == 0u) { if (mn < lat0) lat0 = mn; mean0 = me; }
+            else          { if (mn < lat1) lat1 = mn; mean1 = me; }
+        }
+    }
 
     /* =====================================================================
        CALIBRATION 2: uncontended peer WRITE bandwidth to each die
@@ -183,24 +213,35 @@ int main(int argc, char** argv) {
         far_die = env_u("NVHBI_FAR_DIE", 1u) ? 1u : 0u;
         how = "forced by NVHBI_FAR_DIE";
     } else {
-        // Far die = higher peer read latency (extra NV-HBI hop).
+        // Far die = higher minimum peer atomic latency (the extra NV-HBI hop).
         far_die = (lat1 > lat0) ? 1u : 0u;
-        how = "auto: higher peer read latency";
+        how = "auto: higher min peer atomic latency";
     }
     const unsigned int near_die = 1u - far_die;
-    const double lat_ratio = (lat0 && lat1)
-        ? (double)(far_die ? lat1 : lat0) / (double)(far_die ? lat0 : lat1) : 0.0;
 
     printf("\n================ CALIBRATION ================\n");
-    printf("peer READ latency  : die0=%u cyc, die1=%u cyc\n", lat0, lat1);
+    printf("peer atomic latency (min over %u chunks x %u reps x %u rounds)\n",
+           lat_chunks, lat_reps, lat_rounds);
+    printf("  die0: min=%u cyc  mean=%u cyc\n", lat0, mean0);
+    printf("  die1: min=%u cyc  mean=%u cyc\n", lat1, mean1);
+    printf("  gap : %d cyc\n", (int)lat1 - (int)lat0);
     printf("peer WRITE bw      : die0=%.1f GB/s, die1=%.1f GB/s\n", bw0, bw1);
     printf("=> NEAR die (NVLink-attached) = die%u\n", near_die);
     printf("   FAR  die (extra NV-HBI hop) = die%u   [%s]\n", far_die, how);
-    if (lat_ratio > 0.0 && lat_ratio < 1.08)
-        printf("   *** WARNING: die0/die1 peer latency differ by <8%%. NVLink may not be\n"
-               "       die-attached (ports split across dies, address-routed). exp2 vs exp3\n"
-               "       may then NOT isolate an NV-HBI hop. Consider NVHBI_FAR_DIE and inspect\n"
-               "       the raw numbers before trusting the sweep. ***\n");
+    {
+        const int gap = (int)((lat0 > lat1) ? lat0 - lat1 : lat1 - lat0);
+        if (gap < 50)
+            printf("   *** WARNING: gap is only %d cycles. The two dies are not\n"
+                   "       distinguishable, so NVLink is probably not die-attached and\n"
+                   "       exp2 vs exp3 does not isolate an NV-HBI hop. ***\n", gap);
+        else if (gap > 3000)
+            printf("   *** WARNING: gap is %d cycles, far more than the ~300 an NV-HBI\n"
+                   "       hop should cost. Suspect a measurement artifact (cold lines,\n"
+                   "       TLB, or ordering) rather than topology -- raise\n"
+                   "       NVHBI_LAT_WARMUP/NVHBI_LAT_REPS and re-check. ***\n", gap);
+        else
+            printf("   (gap is in the range an extra die hop should cost)\n");
+    }
     printf("=============================================\n\n");
 
     /* -------- roles resolved -------- */
@@ -283,10 +324,14 @@ int main(int argc, char** argv) {
 
             /* start background, settle */
             CHECK_CUDA(cudaMemset(d_bg_prog, 0, sizeof(unsigned long long)));
-            *stop.h = 0u;
+            nvhbi_stop_flag_reset(stop);
             if (bg_sms) {
+                // Must outlast settle + the whole peer kernel, or the counter
+                // delta gets divided by a window the background was not alive
+                // for. That artifact produced the fake "bg dropped to 120 GB/s"
+                // rows at peer_blocks=16384.
                 const unsigned long long dl =
-                    (unsigned long long)(window_ms + 400u) * (unsigned long long)t.clock_khz;
+                    (unsigned long long)(4u * window_ms + 2000u) * (unsigned long long)t.clock_khz;
                 nvhbi_stress_write<<<t.sm_count * bg_nbps, bg_block, 0, s_bg>>>(
                     t.d_data, t.d_far_idx, t.d_near_idx, t.d_sm_side,
                     bg_writer_partition, bg_local, bg_sms, bg_nbps,
@@ -299,15 +344,34 @@ int main(int argc, char** argv) {
             /* measurement window */
             unsigned long long bg_p0 = 0, bg_p1 = 0, peer_stores = 0;
             CHECK_CUDA(cudaMemcpy(&bg_p0, d_bg_prog, sizeof(bg_p0), cudaMemcpyDeviceToHost));
+            // Clamp the peer grid. Two ways it silently broke the sweep before:
+            //  * more blocks than fit resident -> each WAVE runs the full deadline,
+            //    so peer_ms became waves x window (200 -> 1402 ms at 16384 blocks)
+            //    and peer_GBps fell by exactly that factor.
+            //  * more warps than chunks -> the surplus warps own no chunk and just
+            //    spin, adding waves without adding traffic.
+            unsigned int pb = peer_blocks;
+            if (pb) {
+                const unsigned int wpb  = peer_block / 32u;
+                const unsigned int wave = (unsigned int)prop1.multiProcessorCount
+                                        * (2048u / peer_block);
+                const unsigned int useful = (peer_chunks + wpb - 1u) / wpb;
+                if (pb > wave)   pb = wave;
+                if (pb > useful) pb = useful;
+                if (pb != peer_blocks)
+                    fprintf(stderr, "note: peer_blocks %u -> %u (wave cap %u, chunk cap %u)\n",
+                            peer_blocks, pb, wave, useful);
+            }
+
             float peer_ms = 0.f;
             const double wall0 = now_ms();
-            if (peer_blocks) {
+            if (pb) {
                 CHECK_CUDA(cudaSetDevice(1));
                 CHECK_CUDA(cudaMemset(d_peer_prog, 0, sizeof(unsigned long long)));
                 const unsigned long long pdl =
                     (unsigned long long)window_ms * (unsigned long long)prop1.clockRate;
                 CHECK_CUDA(cudaEventRecord(pe0, s_peer));
-                nvhbi_peer_write<<<peer_blocks, peer_block, 0, s_peer>>>(
+                nvhbi_peer_write<<<pb, peer_block, 0, s_peer>>>(
                     t.d_data, d_peer_idx, peer_first, peer_chunks, 0u, pdl, d_peer_prog, d_sink1);
                 CHECK_CUDA(cudaEventRecord(pe1, s_peer));
                 CHECK_CUDA(cudaGetLastError());
@@ -323,6 +387,11 @@ int main(int argc, char** argv) {
             CHECK_CUDA(cudaMemcpy(&bg_p1, d_bg_prog, sizeof(bg_p1), cudaMemcpyDeviceToHost));
             if (bg_sms) { nvhbi_stop_flag_set(stop); CHECK_CUDA(cudaStreamSynchronize(s_bg)); }
 
+            const double bg_alive_ms = (double)(4u * window_ms + 2000u) - 100.0;
+            if (bg_sms && wall_ms > bg_alive_ms)
+                fprintf(stderr, "WARNING: peer ran %.0f ms but background deadline was %.0f ms "
+                                "-- bg_GBps is understated\n", wall_ms, bg_alive_ms);
+
             const double peer_gbps = (peer_ms > 0.f)
                 ? (double)peer_stores * 32.0 / (peer_ms * 1e-3) / 1e9 : 0.0;
             const double bg_gbps = (bg_sms && wall_ms > 0.0)
@@ -331,7 +400,7 @@ int main(int argc, char** argv) {
                                   + ((exp == 2u) ? peer_gbps : 0.0);
 
             printf("CFG,%u,%u,%u,%u,%u,%u,%u,%.4f,%.2f,%.2f,%.2f\n",
-                   exp, far_die, peer_die, bg_local, bg_sms, peer_blocks, rep,
+                   exp, far_die, peer_die, bg_local, bg_sms, pb, rep,
                    peer_ms, peer_gbps, bg_gbps, crossing);
             fflush(stdout);
         }
@@ -363,7 +432,8 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaEventDestroy(pe0)); CHECK_CUDA(cudaEventDestroy(pe1));
     CHECK_CUDA(cudaStreamDestroy(s_peer));
     CHECK_CUDA(cudaFree(d_near1)); CHECK_CUDA(cudaFree(d_far1));
-    CHECK_CUDA(cudaFree(d_sink1)); CHECK_CUDA(cudaFree(d_lat)); CHECK_CUDA(cudaFree(d_peer_prog));
+    CHECK_CUDA(cudaFree(d_sink1)); CHECK_CUDA(cudaFree(d_lat)); CHECK_CUDA(cudaFree(d_lat2));
+    CHECK_CUDA(cudaFree(d_peer_prog));
     CHECK_CUDA(cudaSetDevice(0));
     CHECK_CUDA(cudaStreamDestroy(s_bg)); CHECK_CUDA(cudaFree(d_bg_prog));
     nvhbi_stop_flag_destroy(stop);

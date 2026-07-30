@@ -298,9 +298,13 @@ __global__ void nvhbi_stress_write(unsigned int* __restrict__ data,
                 ++val;
             }
             done += 4ull * lines_mult;
-            if ((it & 63u) == 63u) {
-                // Publish progress while still running, so the host can sample
-                // background throughput over the foreground's exact window.
+            // Poll rarely. At every 64 iterations this block was the bottleneck:
+            // 4736 warps each reading a MAPPED HOST page over PCIe pinned the
+            // whole kernel to ~337 GB/s regardless of SM count (exp1 says 74 SMs
+            // should reach ~4750). stop_flag now lives in device memory and the
+            // interval is 1024 iterations, which still leaves ~50 progress
+            // samples per 200 ms window.
+            if ((it & 1023u) == 1023u) {
                 if (progress && lane == 0u) { atomicAdd(progress, done * lanes); done = 0ull; }
                 if ((unsigned long long)(clock64() - t0) > deadline_cycles) break;
                 if (stop_flag && *(volatile const unsigned int*)stop_flag) break;
@@ -379,24 +383,59 @@ __global__ void nvhbi_peer_write(unsigned int* __restrict__ peer_data,
    for die-0 chunks against die-1 chunks. A clear gap means the far die really
    is an extra hop away; near-equal latencies mean the assumption is wrong.    */
 
-__global__ void nvhbi_peer_latency(const unsigned int* __restrict__ peer_data,
+__global__ void nvhbi_peer_latency(unsigned int* __restrict__ peer_data,
                                    const unsigned int* __restrict__ idx_list,
                                    unsigned int first,
-                                   unsigned int count,
-                                   unsigned int* __restrict__ out_cycles,
+                                   unsigned int nchunks,
+                                   unsigned int reps,
+                                   unsigned int warmup,
+                                   unsigned int* __restrict__ out_min,
+                                   unsigned int* __restrict__ out_mean,
                                    unsigned int* __restrict__ sink) {
-    if (threadIdx.x != 0 || blockIdx.x != 0 || count == 0u) return;
+    if (threadIdx.x != 0 || blockIdx.x != 0 || nchunks == 0u) return;
+
+    // Time an ATOMIC, not a plain load. An atomic has to travel to the line's
+    // home L2 slice every single time, so no local copy on this GPU can serve it
+    // -- which matters because a remote read was measured to leave a local copy.
+    // Its return value feeds the next address, so accesses cannot overlap.
     unsigned int v = 0u;
-    const unsigned long long t0 = clock64();
+    unsigned int best = ~0u;
+    unsigned long long acc = 0ull;
+    unsigned int n = 0u;
+
+    // Warm the peer mapping, the TLB and the remote lines before timing
+    // anything. The previous version skipped this and walked 512 distinct cold
+    // chunks once each, so whichever die was probed FIRST absorbed all of the
+    // setup cost and came out thousands of cycles slower -- an artifact of
+    // measurement order, not a topology difference.
 #pragma unroll 1
-    for (unsigned int i = 0; i < count; ++i) {
-        // (v & 31) makes each address depend on the previous load, so the
-        // accesses cannot overlap and the total is count x latency.
-        const unsigned int* p = &peer_data[idx_list[first + i] + (v & 31u)];
-        asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(v) : "l"(p));
+    for (unsigned int w = 0; w < warmup; ++w) {
+#pragma unroll 1
+        for (unsigned int c = 0; c < nchunks; ++c)
+            v += atomicAdd(&peer_data[idx_list[first + c]], 1u);
     }
-    const unsigned long long t1 = clock64();
-    *out_cycles = (unsigned int)((t1 - t0) / count);
+
+    // Small working set x many reps, so the lines stay resident and what is left
+    // is the fabric round trip. `min` is the uncontended figure and is far more
+    // robust than a single pass; `mean` exposes how noisy the link was.
+#pragma unroll 1
+    for (unsigned int r = 0; r < reps; ++r) {
+#pragma unroll 1
+        for (unsigned int c = 0; c < nchunks; ++c) {
+            unsigned int* p = &peer_data[idx_list[first + c] + (v & 31u)];
+            unsigned long long t0 = clock64();
+            unsigned int got = atomicAdd(p, 1u);
+            asm volatile("" :: "r"(got));      // force the value before the stamp
+            unsigned long long t1 = clock64();
+            v = got;
+            unsigned int dt = (unsigned int)(t1 - t0);
+            if (dt < best) best = dt;
+            acc += dt;
+            ++n;
+        }
+    }
+    *out_min  = best;
+    *out_mean = (unsigned int)(acc / (n ? n : 1u));
     nvhbi_st(&sink[0], v);
 }
 
@@ -570,22 +609,29 @@ static inline double nvhbi_footprint_mb(unsigned int num_active_sm,
            * (double)NVHBI_CHUNK_BYTES / (1024.0 * 1024.0);
 }
 
-/* -------- mapped host flag, so the host can stop a running background kernel */
+/* -------- stop flag, in DEVICE memory --------
+   It used to be mapped host memory, which meant every polling warp issued a
+   PCIe read; that alone capped nvhbi_stress_write at ~337 GB/s. Device memory
+   costs an L2 hit instead, and the host sets it with a 4-byte H2D copy (safe to
+   issue while the kernel runs, since the stress kernel is on a non-blocking
+   stream).                                                                   */
 
 struct NvhbiStopFlag {
-    unsigned int* h = nullptr;   // host-visible
-    unsigned int* d = nullptr;   // device-visible alias
+    unsigned int* d = nullptr;
 };
 
 static void nvhbi_stop_flag_create(NvhbiStopFlag& f) {
-    CHECK_CUDA(cudaHostAlloc((void**)&f.h, sizeof(unsigned int), cudaHostAllocMapped));
-    *f.h = 0u;
-    CHECK_CUDA(cudaHostGetDevicePointer((void**)&f.d, f.h, 0));
+    CHECK_CUDA(cudaMalloc((void**)&f.d, sizeof(unsigned int)));
+    CHECK_CUDA(cudaMemset(f.d, 0, sizeof(unsigned int)));
+}
+static void nvhbi_stop_flag_reset(NvhbiStopFlag& f) {
+    CHECK_CUDA(cudaMemset(f.d, 0, sizeof(unsigned int)));
 }
 static void nvhbi_stop_flag_set(NvhbiStopFlag& f) {
-    *(volatile unsigned int*)f.h = 1u;
+    const unsigned int one = 1u;
+    CHECK_CUDA(cudaMemcpy(f.d, &one, sizeof(one), cudaMemcpyHostToDevice));
 }
 static void nvhbi_stop_flag_destroy(NvhbiStopFlag& f) {
-    if (f.h) CHECK_CUDA(cudaFreeHost(f.h));
+    if (f.d) CHECK_CUDA(cudaFree(f.d));
     f = NvhbiStopFlag{};
 }
