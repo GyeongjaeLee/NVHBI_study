@@ -402,13 +402,21 @@ __global__ void nvhbi_peer_write(unsigned int* __restrict__ peer_data,
                                  unsigned int idle_cycles,
                                  unsigned long long* __restrict__ progress,
                                  unsigned int* __restrict__ sink) {
+    // Warp id from (block, warp-in-block), NOT from the flat thread id. The two
+    // agree whenever blockDim is a multiple of 32, and only the former survives
+    // a SUB-WARP block size: with blockDim=1 the flat form gives every block in
+    // a group of 32 the same gwarp and an nwarps of gridDim/32, so all of them
+    // walk the identical chunk sequence -- 32 writers piled on one sector at a
+    // time, and an nwarps of 0 (hence an infinite inner loop) for small grids.
+    const unsigned int wpb    = (blockDim.x + 31u) / 32u;
+    const unsigned int wib    = threadIdx.x / 32u;
     const unsigned int lane   = threadIdx.x % 32u;
-    const unsigned int gwarp  = (blockIdx.x * blockDim.x + threadIdx.x) / 32u;
-    const unsigned int nwarps = (gridDim.x * blockDim.x) / 32u;
+    const unsigned int gwarp  = blockIdx.x * wpb + wib;
+    const unsigned int nwarps = gridDim.x * wpb;
     if (count == 0u) return;
 
     const unsigned long long lanes =
-        (unsigned long long)min(32u, blockDim.x - (threadIdx.x / 32u) * 32u);
+        (unsigned long long)min(32u, blockDim.x - wib * 32u);
 
     unsigned int val = gwarp * 2654435761u + lane + 1u;
     unsigned long long done = 0ull;
@@ -466,14 +474,18 @@ __global__ void nvhbi_peer_read(const unsigned int* __restrict__ peer_data,
                                 unsigned int cv,
                                 unsigned long long* __restrict__ progress,
                                 unsigned int* __restrict__ sink) {
+    // See nvhbi_peer_write: (block, warp-in-block) rather than the flat thread
+    // id, so a sub-warp block size still gives every warp its own chunk stream.
+    const unsigned int wpb    = (blockDim.x + 31u) / 32u;
+    const unsigned int wib    = threadIdx.x / 32u;
     const unsigned int lane   = threadIdx.x % 32u;
-    const unsigned int gwarp  = (blockIdx.x * blockDim.x + threadIdx.x) / 32u;
-    const unsigned int nwarps = (gridDim.x * blockDim.x) / 32u;
+    const unsigned int gwarp  = blockIdx.x * wpb + wib;
+    const unsigned int nwarps = gridDim.x * wpb;
     // deadline_cycles is the ONLY exit; a zero deadline would spin forever.
     if (count == 0u || deadline_cycles == 0ull) return;
 
     const unsigned long long lanes =
-        (unsigned long long)min(32u, blockDim.x - (threadIdx.x / 32u) * 32u);
+        (unsigned long long)min(32u, blockDim.x - wib * 32u);
 
     unsigned int acc = 0u;
     unsigned long long done = 0ull;

@@ -102,7 +102,7 @@ echo "  -> $OUTDIR/exp1.csv ($(( $(wc -l < "$OUTDIR/exp1.csv") - 1 )) rows)"
 nvhbi_clock_snapshot "after-exp1" "$GPU_ID" | tee -a "$MANIFEST"
 
 # ---------------------------------------------------------------- exp2/3
-EXP23_HEADER="exp,far_die,peer_die,bg_local,bg_sms,peer_blocks,rep,peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz,peer_ovl"
+EXP23_HEADER="exp,far_die,peer_die,bg_local,bg_sms,peer_blocks,rep,peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz,peer_ovl,peer_bsize"
 ndev=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d ' ')
 if [[ "$ndev" -lt 2 ]]; then
   echo "--- exp2/exp3 skipped: needs 2 GPUs, found $ndev ---"
@@ -112,7 +112,7 @@ else
       name="exp${e}_bglocal${local}"
       echo "--- $name ---"
       NVHBI_BG_LOCAL="$local" ./nvhbi_exp23_peer "$e" > "$OUTDIR/$name.log" 2>&1
-      { echo "$EXP23_HEADER"; nvhbi_cfg_rows "$OUTDIR/$name.log" 13; } > "$OUTDIR/$name.csv"
+      { echo "$EXP23_HEADER"; nvhbi_cfg_rows "$OUTDIR/$name.log" 14; } > "$OUTDIR/$name.csv"
       echo "  -> $OUTDIR/$name.csv ($(( $(wc -l < "$OUTDIR/$name.csv") - 1 )) rows)"
     done
   done

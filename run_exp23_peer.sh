@@ -24,7 +24,7 @@
 #   ./run_exp23_peer.sh                     # all four runs
 #   ./run_exp23_peer.sh 2                   # exp2 only (both background modes)
 #   NVHBI_BG_SMS_LIST=0,8,16,32,64,74 \
-#   NVHBI_PEER_BLOCKS_LIST=0,64,256,1024,4096 ./run_exp23_peer.sh
+#   NVHBI_PEER_BLOCK_SIZES=0,1,4,16,64,128 ./run_exp23_peer.sh
 #   NVHBI_MEMCPY=1 ./run_exp23_peer.sh      # also time cudaMemcpyPeer
 #
 # Two knobs worth running before believing a flat result:
@@ -44,8 +44,8 @@ PROG="nvhbi_exp23_peer"
 CSV_OUT="${CSV_OUT:-exp23_peer.csv}"
 LOG_OUT="${LOG_OUT:-exp23_peer.log}"
 WHICH="${1:-both}"
-CFG_FIELDS=13
-CFG_HEADER="exp,far_die,peer_die,bg_local,bg_sms,peer_blocks,rep,peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz,peer_ovl"
+CFG_FIELDS=14
+CFG_HEADER="exp,far_die,peer_die,bg_local,bg_sms,peer_blocks,rep,peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz,peer_ovl,peer_bsize"
 
 ndev=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d ' ')
 if [[ "$ndev" -lt 2 ]]; then

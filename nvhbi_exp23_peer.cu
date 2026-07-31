@@ -39,11 +39,23 @@
 //
 // Env: NVHBI_FAR_DIE            override auto-detection (0 or 1)
 //      NVHBI_BG_SMS_LIST        background SM counts, 0=off. default "0,16,32,64,74"
-//      NVHBI_PEER_BLOCKS_LIST   peer grid sizes, 0=off.      default "0,256,1024,4096,16384"
+//      NVHBI_PEER_BLOCKS_PER_SM peer blocks per SM, FIXED across the sweep. default 32
+//                               (the same convention as NVHBI_BG_BLOCKS_PER_SM).
+//                               The launched grid is sm_count x this, clamped to
+//                               what stays resident -- see the note below.
+//      NVHBI_PEER_BLOCK_SIZES   peer block sizes, 0=off. default "0,1,2,4,8,16,32,64,128"
+//                               This is the swept axis. Below 32 it varies the
+//                               ACTIVE LANES PER WARP, i.e. how many 32B sectors
+//                               one store instruction touches (1..32); above 32
+//                               it varies warps per block (1..4). One continuous
+//                               injection ramp from 32 threads to 4096.
 //      NVHBI_BG_LOCAL           1 = background stays on die A (control), default 0
 //      NVHBI_WINDOW_MS          measurement window per point, default 200
 //      NVHBI_REPEAT             reps per point,               default 3
-//      NVHBI_PEER_CHUNKS        peer footprint in 4KiB chunks,default 4096 (16MB)
+//      NVHBI_PEER_CHUNKS        peer footprint in 4KiB chunks. 0 (default) sizes
+//                               it automatically to one chunk per injecting warp
+//                               at the widest point of the sweep -- a warp with no
+//                               chunk of its own contributes nothing.
 //      NVHBI_BG_BLOCK / NVHBI_BG_BLOCKS_PER_SM / NVHBI_BG_LINES
 //      NVHBI_PEER_MODE          0 = GPU1 kernel P2P stores (default)
 //                               1 = cudaMemcpyPeerAsync (copy engines, die-agnostic)
@@ -86,7 +98,7 @@ int main(int argc, char** argv) {
     const unsigned int exp = (argc > 1) ? (unsigned int)atoi(argv[1]) : 2u;
     if (exp != 2u && exp != 3u) { fprintf(stderr, "usage: %s [2|3]\n", argv[0]); return 1; }
 
-    const unsigned int peer_chunks_req = env_u("NVHBI_PEER_CHUNKS", 4096u);
+    unsigned int peer_chunks_req = env_u("NVHBI_PEER_CHUNKS", 0u);   // 0 = auto
     const unsigned int bg_block  = env_u("NVHBI_BG_BLOCK", 64u);
     const unsigned int bg_nbps   = env_u("NVHBI_BG_BLOCKS_PER_SM", 32u);
     const unsigned int bg_lines  = env_u("NVHBI_BG_LINES", 1u);
@@ -107,12 +119,33 @@ int main(int argc, char** argv) {
     const unsigned int peer_idle    = env_u("NVHBI_PEER_IDLE", 0u);
     const unsigned int peer_overlap = env_u("NVHBI_PEER_OVERLAP", 0u);
 
-    unsigned int bg_list[32], pk_list[32];
+    // The injection axis is the peer BLOCK SIZE at a fixed blocks-per-SM;
+    // sweeping the grid instead put every point past saturation (16 blocks of 128
+    // threads already reached 644 GB/s) and, more usefully, block size is the only
+    // knob that reaches below one full warp: at blockDim<32 a store instruction
+    // touches fewer than 32 sectors, which the grid size cannot express.
+    //
+    // At 32 blocks/SM the occupancy ceiling is real and shows up inside the
+    // sweep: 32 x 128 = 4096 threads per SM against a 2048 limit, so block size
+    // 128 can only keep 16 blocks/SM resident. That is clamped rather than run,
+    // because a grid that needs two waves makes EACH wave run the full deadline
+    // and halves the reported bandwidth for a reason that has nothing to do with
+    // the fabric.
+    const unsigned int peer_nbps = env_u("NVHBI_PEER_BLOCKS_PER_SM", 32u);
+    unsigned int bg_list[32], bs_list[32];
     const int bg_n = parse_list("NVHBI_BG_SMS_LIST", "0,16,32,64,74", bg_list, 32);
-    // Starts at 1 block. The old list started at 16 and every point from there up
-    // read 634-645 GB/s, i.e. the axis began past saturation and showed nothing.
-    const int pk_n = parse_list("NVHBI_PEER_BLOCKS_LIST",
-                                "0,1,2,4,8,16,64,256,1024", pk_list, 32);
+    const int bs_n = parse_list("NVHBI_PEER_BLOCK_SIZES",
+                                "0,1,2,4,8,16,32,64,128", bs_list, 32);
+
+    // Resident blocks per SM for a block size: thread-limited at 2048 threads,
+    // and never more than the 32 block slots an SM has.
+    auto resident_bps = [&](unsigned int bs, unsigned int want) {
+        unsigned int bps = want;
+        const unsigned int thr = (bs && bs <= 2048u) ? (2048u / bs) : 1u;
+        if (bps > thr) bps = thr;
+        if (bps > 32u) bps = 32u;
+        return bps ? bps : 1u;
+    };
 
     int ndev = 0;
     CHECK_CUDA(cudaGetDeviceCount(&ndev));
@@ -131,6 +164,22 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaGetDeviceProperties(&prop1, 1));
     int prop1_clock_khz = 0;   // clockRate left cudaDeviceProp in CUDA 13
     CHECK_CUDA(cudaDeviceGetAttribute(&prop1_clock_khz, cudaDevAttrClockRate, 1));
+
+    // Every injecting warp needs a chunk of its own: nvhbi_peer_write hands warp
+    // w the chunks w, w+nwarps, ... so a warp with gwarp >= count never enters the
+    // loop body and contributes nothing but occupancy. Size the region from the
+    // widest point of the sweep rather than a fixed default, or the top of the
+    // block-size axis silently measures fewer warps than it launched.
+    unsigned int peer_warps_max = 0;
+    for (int i = 0; i < bs_n; ++i) {
+        if (!bs_list[i]) continue;
+        const unsigned int w = (unsigned int)prop1.multiProcessorCount
+                             * resident_bps(bs_list[i], peer_nbps)
+                             * ((bs_list[i] + 31u) / 32u);
+        if (w > peer_warps_max) peer_warps_max = w;
+    }
+    const bool peer_chunks_auto = (peer_chunks_req == 0u);
+    if (peer_chunks_auto) peer_chunks_req = peer_warps_max ? peer_warps_max : 4096u;
 
     /* -------- GPU1-side copies of BOTH chunk lists (for calibration+peer) -------- */
     unsigned int* d_near1 = nullptr;   // die-0 chunk offsets, on GPU1
@@ -393,7 +442,30 @@ int main(int argc, char** argv) {
            peer_first, peer_first + peer_chunks, peer_die,
            peer_chunks * (double)NVHBI_CHUNK_BYTES / (1024.0 * 1024.0),
            peer_ovl ? "   [OVERLAPPING the background's chunks]" : "");
-    printf("  peer stores: %u idle cycles per store group\n\n", peer_idle);
+    printf("  peer grid: %u blocks per SM x %d SMs, block size is the swept axis\n"
+           "             (below 32 it sets active lanes per warp = sectors per store\n"
+           "              instruction; above 32 it sets warps per block)\n",
+           peer_nbps, prop1.multiProcessorCount);
+    printf("  peer region sized %s: %u chunks for up to %u injecting warps"
+           " (%.0f%% of one die's L2)\n",
+           peer_chunks_auto ? "automatically" : "by NVHBI_PEER_CHUNKS",
+           peer_chunks, peer_warps_max,
+           100.0 * peer_chunks * NVHBI_CHUNK_BYTES / (t.l2_bytes / 2.0));
+    {
+        // What die `peer_die` has to hold: the background's reserved chunks (when
+        // it targets the same die) plus the peer region that sits after them.
+        const double used = (double)(peer_first + peer_chunks) * NVHBI_CHUNK_BYTES;
+        const double die_l2 = t.l2_bytes / 2.0;
+        printf("  die%u L2 footprint: %.1f MB of %.1f MB (%.0f%%)\n\n",
+               peer_die, used / 1048576.0, die_l2 / 1048576.0, 100.0 * used / die_l2);
+        if (used > 0.8 * die_l2)
+            fprintf(stderr, "WARNING: background + peer need %.0f%% of die%u's L2. Not all of\n"
+                            "         it stays resident, so some writes miss to HBM and the\n"
+                            "         numbers stop being pure remote-L2 traffic. Lower\n"
+                            "         NVHBI_PEER_BLOCKS_PER_SM or NVHBI_PEER_CHUNKS.\n",
+                    100.0 * used / die_l2, peer_die);
+    }
+    printf("  peer stores: %u idle cycles per store group\n", peer_idle);
 
     /* -------- background machinery on GPU0 -------- */
     if (peer_mode == 1u) {
@@ -425,7 +497,6 @@ int main(int argc, char** argv) {
     nvhbi_stop_flag_create(stop);
 
     const unsigned int* d_peer_idx = die_list1(peer_die);   // GPU1-side list for the target die
-    const unsigned int  peer_block = 128u;
 
     // Time-resolved trace of the background alone. exp1 measures over ms 8-25 of
     // a 25 ms kernel; this experiment samples ms 100-300 of a 300 ms one. If the
@@ -475,13 +546,13 @@ int main(int argc, char** argv) {
     // New columns are APPENDED, never inserted: the run scripts' awk still
     // addresses the old ones by position.
     printf("# CFG,exp,far_die,peer_die,bg_local,bg_sms,peer_blocks,rep,"
-           "peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz,peer_ovl\n");
+           "peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz,peer_ovl,peer_bsize\n");
 
     for (int bi = 0; bi < bg_n; ++bi) {
-    for (int pi = 0; pi < pk_n; ++pi) {
+    for (int pi = 0; pi < bs_n; ++pi) {
         const unsigned int bg_sms      = bg_list[bi];
-        const unsigned int peer_blocks = pk_list[pi];
-        if (bg_sms == 0u && peer_blocks == 0u) continue;
+        const unsigned int peer_bs = bs_list[pi];
+        if (bg_sms == 0u && peer_bs == 0u) continue;
         const unsigned int bg_chunks = bg_sms
             ? nvhbi_chunks_used(bg_sms, bg_nbps, bg_block, bg_lines) : 0u;
 
@@ -494,7 +565,7 @@ int main(int argc, char** argv) {
                     t.d_data, (bg_target_die==1u)?t.d_far_idx:t.d_near_idx,
                     0u, bg_chunks, t.d_sm_side, bg_target_die, t.d_sink);
             }
-            if (peer_blocks) {
+            if (peer_bs) {
                 nvhbi_warm_chunks<<<t.sm_count * 8, 128>>>(
                     t.d_data, d_peer_own, peer_first, peer_chunks,
                     t.d_sm_side, peer_die, t.d_sink);
@@ -533,22 +604,32 @@ int main(int argc, char** argv) {
             //    and peer_GBps fell by exactly that factor.
             //  * more warps than chunks -> the surplus warps own no chunk and just
             //    spin, adding waves without adding traffic.
-            unsigned int pb = peer_blocks;
-            if (pb) {
-                const unsigned int wpb  = peer_block / 32u;
-                const unsigned int wave = (unsigned int)prop1.multiProcessorCount
-                                        * (2048u / peer_block);
-                const unsigned int useful = (peer_chunks + wpb - 1u) / wpb;
-                if (pb > wave)   pb = wave;
-                if (pb > useful) pb = useful;
-                if (pb != peer_blocks)
-                    fprintf(stderr, "note: peer_blocks %u -> %u (wave cap %u, chunk cap %u)\n",
-                            peer_blocks, pb, wave, useful);
+            // wpb is forced to at least 1 -- the old peer_block/32 was 0 for any
+            // sub-warp block size and the `useful` division below then divided by
+            // zero, which would have crashed the moment this axis went below 32.
+            unsigned int pb = 0u, bps = 0u;
+            if (peer_bs) {
+                const unsigned int wpb = (peer_bs + 31u) / 32u;
+                bps = resident_bps(peer_bs, peer_nbps);
+                pb  = (unsigned int)prop1.multiProcessorCount * bps;
+                unsigned int useful = peer_chunks / wpb;      // blocks, so warps <= chunks
+                if (!useful) useful = 1u;
+                if (pb > useful) {
+                    pb = useful;
+                    fprintf(stderr, "note: block size %u: grid %u -> %u blocks "
+                                    "(only %u chunks for %u warps/block)\n",
+                            peer_bs, (unsigned int)prop1.multiProcessorCount * bps,
+                            pb, peer_chunks, wpb);
+                }
+                if (bps != peer_nbps)
+                    fprintf(stderr, "note: block size %u: %u -> %u blocks/SM "
+                                    "(2048 threads/SM and 32 block slots)\n",
+                            peer_bs, peer_nbps, bps);
             }
 
             float peer_ms = 0.f;
             const double wall0 = now_ms();
-            if (pb && peer_mode == 1u) {
+            if (pb && peer_bs && peer_mode == 1u) {
                 // Keep the copy engines busy for the whole window, then divide
                 // the bytes actually copied by the time they took.
                 CHECK_CUDA(cudaSetDevice(1));
@@ -566,13 +647,13 @@ int main(int argc, char** argv) {
                 CHECK_CUDA(cudaEventElapsedTime(&peer_ms, pe0, pe1));
                 // Report DMA in the same units as the kernel path: 32B sectors.
                 peer_stores = (unsigned long long)ncopy * (dma_bytes / 32u);
-            } else if (pb) {
+            } else if (pb && peer_bs) {
                 CHECK_CUDA(cudaSetDevice(1));
                 CHECK_CUDA(cudaMemset(d_peer_prog, 0, sizeof(unsigned long long)));
                 const unsigned long long pdl =
                     (unsigned long long)window_ms * (unsigned long long)prop1_clock_khz;
                 CHECK_CUDA(cudaEventRecord(pe0, s_peer));
-                nvhbi_peer_write<<<pb, peer_block, 0, s_peer>>>(
+                nvhbi_peer_write<<<pb, peer_bs, 0, s_peer>>>(
                     t.d_data, d_peer_idx, peer_first, peer_chunks, 0u, pdl,
                     peer_idle, d_peer_prog, d_sink1);
                 CHECK_CUDA(cudaEventRecord(pe1, s_peer));
@@ -615,10 +696,11 @@ int main(int argc, char** argv) {
             const double crossing = (bg_local ? 0.0 : bg_gbps)
                                   + ((exp == 2u) ? peer_gbps : 0.0);
 
-            printf("CFG,%u,%u,%u,%u,%u,%u,%u,%.4f,%.2f,%.2f,%.2f,%.3f,%u\n",
-                   exp, far_die, peer_die, bg_local, bg_sms, pb, rep,
+            printf("CFG,%u,%u,%u,%u,%u,%u,%u,%.4f,%.2f,%.2f,%.2f,%.3f,%u,%u\n",
+                   exp, far_die, peer_die, bg_local, bg_sms,
+                   peer_bs ? pb : 0u, rep,
                    peer_ms, peer_gbps, bg_gbps, crossing, bg_ghz,
-                   peer_ovl ? 1u : 0u);
+                   peer_ovl ? 1u : 0u, peer_bs);
             fflush(stdout);
         }
     }}

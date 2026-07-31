@@ -29,6 +29,7 @@ import re
 import sys
 from collections import defaultdict
 from statistics import median
+import matplotlib.ticker as ticker
 
 import matplotlib
 matplotlib.use("Agg")
@@ -38,7 +39,7 @@ import matplotlib.pyplot as plt
 # columns by name and never by position.
 EXP1_HEADER_HINT = "writer_partition,own_die,num_active_sm"
 EXP23_HEADER = ("exp,far_die,peer_die,bg_local,bg_sms,peer_blocks,rep,"
-                "peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz,peer_ovl")
+                "peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz,peer_ovl,peer_bsize")
 PL2_HEADER = ("kind,die,is_far,state,cv,corun,rep,peer_cyc,local_cyc,"
               "peer_GBps,co_GBps,chunks")
 EXP4_HEADER = "exp,bg_local,bg_sms,msg_bytes,rep,nccl_ms,algbw_GBps,busbw_GBps,bg_GBps"
@@ -86,24 +87,27 @@ def i(row, key):
         return -1
 
 
-# The peer kernel's block size is fixed in nvhbi_exp23_peer.cu and is not in the
-# CSV, so the axis label has to carry it from here.
-PEER_BLOCK_THREADS = 128
+def peer_grid_info(session_dir, stem, default_sms=148):
+    """(SM count, peer blocks/SM) for the exp2/3 injection-axis label.
 
-
-def peer_gpu_sms(session_dir, stem, default=148):
-    """SM count of the injecting GPU, for the exp2/3 grid-size axis label.
-
-    Not a CSV column, so it comes from the run log's probe line. Both GPUs in
-    these sessions are the same part, and the probe only prints gpu0.
+    Neither is a CSV column. The SM count comes from the probe line; the
+    blocks-per-SM is the REQUESTED value from the config line, which is what the
+    label should say -- the CSV's peer_blocks holds the grid actually launched,
+    and that gets clamped at the top of the block-size sweep where 32 blocks/SM
+    would need 4096 threads against a 2048 limit.
     """
+    sms, bps = default_sms, None
     log_path = os.path.join(session_dir, stem + ".log")
     if os.path.exists(log_path):
         for line in open(log_path):
+            if bps is None:
+                m = re.search(r"peer grid: (\d+) blocks per SM", line)
+                if m:
+                    bps = int(m.group(1))
             m = re.search(r"SMs=(\d+)", line)
             if m:
-                return int(m.group(1))
-    return default
+                sms = int(m.group(1))
+    return sms, bps
 
 
 def sm_ticks(ax, allx):
@@ -177,7 +181,7 @@ def plot_exp1(rows, outdir):
         print(f"  wrote {path}")
 
 
-def plot_exp23(rows, stem, outdir, peer_sms=148):
+def plot_exp23(rows, stem, outdir, peer_sms=148, peer_bps=None):
     """Two panels, and the x axes are deliberately different.
 
     LEFT is the experiment: x is the NVLink load in GB/s, y is the background's
@@ -203,19 +207,27 @@ def plot_exp23(rows, stem, outdir, peer_sms=148):
                else "cross-die background")
     peer_desc = "peer -> FAR die" if exp == 2 else "peer -> NEAR die"
 
-    bg = defaultdict(lambda: defaultdict(list))    # [bg_sms][peer_blocks]
+    # The injection knob changed from grid size to block size. Detect which one
+    # this CSV actually varies rather than assuming, so older sessions still plot.
+    bsizes = {i(r, "peer_bsize") for r in rows if i(r, "peer_bsize") > 0}
+    by_bsize = len(bsizes) > 1
+    key = (lambda r: i(r, "peer_bsize")) if by_bsize else (lambda r: i(r, "peer_blocks"))
+    fixed = {i(r, "peer_blocks") for r in rows if i(r, "peer_blocks") > 0}
+    fixed_blocks = min(fixed) if fixed else 0
+
+    bg = defaultdict(lambda: defaultdict(list))    # [bg_sms][injection knob]
     pr = defaultdict(lambda: defaultdict(list))
     for r in rows:
-        s, pb = i(r, "bg_sms"), i(r, "peer_blocks")
+        s, k = i(r, "bg_sms"), key(r)
         if s > 0:
-            bg[s][pb].append(f(r, "bg_GBps"))
-        if pb > 0:
-            pr[s][pb].append(f(r, "peer_GBps"))
+            bg[s][k].append(f(r, "bg_GBps"))
+        if k > 0:
+            pr[s][k].append(f(r, "peer_GBps"))
 
-    # peer_blocks -> offered NVLink load in GB/s (measured with no background).
+    # knob -> offered NVLink load in GB/s (measured with no background).
     # Falls back to the smallest background if the bg_sms=0 row is missing.
     ref = pr.get(0) or (pr[min(pr)] if pr else {})
-    offered = {pb: median(v) for pb, v in ref.items()}
+    offered = {k: median(v) for k, v in ref.items()}
 
     fig, (axl, axr) = plt.subplots(1, 2, figsize=(12.8, 5.0))
     cmap = plt.get_cmap("viridis")
@@ -238,18 +250,25 @@ def plot_exp23(rows, stem, outdir, peer_sms=148):
     axl.set_title("Does NVLink traffic cost the background anything?")
     axl.set_xlim(left=0)
 
-    # x = the peer grid size itself, i.e. how many blocks GPU1 injects with.
+    # x = whichever injection knob this run actually swept. Log base 2 because
+    # the sweep is a power-of-two ladder, with plain (non-exponent) tick labels.
     for s in sms_pr:
         xs = sorted(pr[s])
         ys = [median(pr[s][x]) / 1000.0 for x in xs]
         axr.plot(xs, ys, marker="s", markersize=4,
                  color=colour(s, sms_pr),
                  label=("no bg" if s == 0 else f"bg {s} SMs"))
-    axr.set_xlabel(f"Number of blocks ({peer_sms} SM, "
-                   f"block size {PEER_BLOCK_THREADS})")
+    axr.set_xscale("log", base=2)
+    axr.xaxis.set_major_formatter(ticker.ScalarFormatter())
+    axr.ticklabel_format(style='plain', axis='x')
+    if by_bsize:
+        grid = (f"{peer_bps} blocks/SM" if peer_bps
+                else f"{fixed_blocks} blocks")
+        axr.set_xlabel(f"Block size ({peer_sms} SM, {grid})")
+    else:
+        axr.set_xlabel(f"Number of blocks ({peer_sms} SM)")
     axr.set_ylabel("Throughput (TB/s)")
     axr.set_title("Where the NVLink load axis saturates")
-    axr.set_xlim(left=0)
 
     for ax in (axl, axr):
         ax.grid(True, alpha=0.3)
@@ -498,8 +517,8 @@ def main():
                  "exp3_bglocal0", "exp3_bglocal1"):
         rows = load_rows(args.session_dir, stem, EXP23_HEADER)
         print(f"{stem}: {len(rows)} rows")
-        plot_exp23(rows, stem, outdir,
-                   peer_sms=peer_gpu_sms(args.session_dir, stem))
+        _sms, _bps = peer_grid_info(args.session_dir, stem)
+        plot_exp23(rows, stem, outdir, peer_sms=_sms, peer_bps=_bps)
         summarise_exp23(rows, stem)
 
     for stem in ("exp4_bglocal0", "exp4_bglocal1", "exp4_nccl"):
