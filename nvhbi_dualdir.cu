@@ -1,118 +1,81 @@
-// nvhbi_dualdir.cu -- load ONE fabric direction from two sources at once.
+// nvhbi_dualdir.cu -- drive ONE fabric direction with two payload sources.
 //
-//     die A SMs  write into die B memory  -> payload travels A -> B
-//     die B SMs  read  from die A memory  -> request B->A (small),
-//                                            PAYLOAD returns A -> B
+//     die A SMs  write into die B L2   -> payload travels A -> B
+//     die B SMs  read  from die A HBM  -> request B->A (small),
+//                                         PAYLOAD returns A -> B
 //
-// Both payloads move A->B, and they are issued by different SMs on different
-// dies, so neither mechanism's own issue-rate ceiling caps the total. Writes
-// alone stop around 3.4 TB/s because the scattered store pattern costs 32
-// transactions per instruction; the reads are here to find out whether that is
-// the fabric's limit or only the write path's.
+// Both payloads move A->B and are issued by different SMs on different dies, so
+// neither source's own issue rate caps the total.
 //
-// ONE kernel, not two
-// -------------------
-// Writers and readers share a single launch and are separated by which die the
-// SM sits on. As two separate kernels they each asked for a full 148x32 grid,
-// oversubscribing the GPU 2x, so they contended for SM slots rather than for
-// the link: the write counter read exactly 0.00 on the first repeat of every
-// point and about half its solo rate afterwards. With one grid every SM gets
-// its nbps blocks and the only shared resource left is the fabric.
+// WHAT IT MEASURED (B200, one session, buf_mult=64)
+//     write alone, 70 SMs            2320 GB/s
+//     read  alone, 76 SMs            1887
+//     both  together            1063 + 1075 = 2138
 //
-// Read shape
-// ----------
-// Contiguous 16B per lane, eight instructions covering the 4KiB chunk. A
-// 128B-stride variant (one 4B load per lane, one instruction per chunk) was
-// tried and removed: an L2 line is 128B but fills per 32B sector, so a 4B load
-// pulls 32B, not 128B. Counting it as 128B overstated read bandwidth 4x -- it
-// reported 18.5 TB/s for a local streaming read, more than HBM can supply.
+// The combination is WORSE than writes alone, and the link splits almost
+// exactly 50/50 between the two sources with under 0.1% run-to-run spread. So
+// writes on their own already saturate this direction; reads do not add
+// headroom, they take a share and cost about 8% in mixing. The hypothesis this
+// program was written to test -- that the scattered store pattern was leaving
+// fabric capacity unused -- is refuted. Other sessions put write-alone at
+// 3.4-3.5 TB/s; the instance-to-instance spread is about 1.5x, so only compare
+// numbers from one run.
 //
-// Reads must STREAM. A remote read leaves a replica on the reading die, so a
-// chunk touched twice is served locally the second time and never crosses
-// again. Sweeping the whole source die (506 MB against a 63 MB L2) fixed it:
-// read bandwidth fell 18948 -> 6857 -> 3319 -> 2985 GB/s as the footprint grew
-// 8 -> 64 -> 256 -> 506 MB, converging once reuse became impossible. The 8 MB
-// figure matched the local control exactly, which is what a pure replica hit
-// looks like.
+// Design points that were settled by measurement, and why they look like this:
+//
+//  * ONE kernel, not two. As separate launches each asked for a full 148x32
+//    grid, oversubscribing the GPU 2x, so they fought over SM slots instead of
+//    the link: the write counter read exactly 0.00 on the first repeat of every
+//    point. One grid gives every SM its blocks and leaves the fabric as the
+//    only shared resource.
+//
+//  * Reads use a 128B stride, one 4B load per line, ONE instruction per 4KiB
+//    chunk. A contiguous 16B/lane version that reads all 4096 B explicitly was
+//    measured alongside it: 1909 vs 1826 GB/s, i.e. the same, with 8x the
+//    instructions. Equality also settles the granularity question -- if a 4B
+//    load pulled only a 32B sector, the strided count would have overstated
+//    traffic 4x and read ~4x higher. It does not, so a 4B remote load really
+//    drags a whole 128B line across.
+//
+//  * Reads must STREAM over a footprint far larger than L2. A remote read
+//    leaves a replica on the reading die, so a chunk touched twice is served
+//    locally and never crosses again. Read bandwidth fell 5960 -> 4820 -> 2390
+//    -> 1920 GB/s as the sweep grew 0.5 -> 1 -> 2 -> 4 GB; only the last is
+//    fabric traffic. Hence buf_mult defaults to 64.
+//
+//  * ld.global.cg. The .cs (evict-first) and .cv (re-fetch) variants were tried:
+//    .cs moved read from 1076 to 1129 GB/s and left write unchanged, .cv the
+//    same. Cache hints cannot protect the writers' working set when reads churn
+//    the whole L2 every ~33 us.
+//
+//  * NVHBI_R_LOCAL=1 keeps the readers on their own die. It is the validity
+//    control: it fills die B's L2 just as hard but crosses nothing, and it
+//    separates the two ways reads hurt writes -- local reads cost writes 16%
+//    (eviction), crossing reads cost 54% (eviction plus fabric).
 //
 // argv: [writer_partition]  0|1   (die A = writing die; readers sit on die B)
 //
 // Env: NVHBI_W_SMS      writer SM counts, 0=off.  default "0,70"
-//      NVHBI_R_SMS      reader SM counts, 0=off.  default "0,16,32,64,78"
+//      NVHBI_R_SMS      reader SM counts, 0=off.  default "0,8,16,32,64,78"
 //      NVHBI_R_CHUNKS   read sweep in 4KiB chunks, 0 = whole source die (default)
 //      NVHBI_R_LOCAL    1 = readers read their OWN die (crosses nothing), default 0
+//      NVHBI_BUF_MULT   allocation as a multiple of L2, default 64 (~4 GB/die)
 //      NVHBI_WINDOW_MS  default 200      NVHBI_REPEAT default 3
 //      NVHBI_BLOCK / NVHBI_BLOCKS_PER_SM   default 64 / 32
-//      NVHBI_BUF_MULT   default 8
-//
-// Build switches:
-//      -DNVHBI_READ_OP=0|1|2   .cg (default) | .cv | .cs
-//          .cs marks the replica evict-first, protecting the writers' warmed
-//          lines, but can also drop a line between the lanes that share it.
-//          .cv forces a re-fetch. .cg is the plain L1-bypassing load.
-//      -DNVHBI_STORE_MODE=0|3  scattered (default) | contiguous, see nvhbi_common.cuh
 
 #include "nvhbi_common.cuh"
 #include <chrono>
 
-#ifndef NVHBI_READ_OP
-#define NVHBI_READ_OP 0
-#endif
-// Read shape. Both cover the same 4KiB chunk and count the same 128 sectors,
-// but they bet differently on the cross-die transfer granularity:
-//   0 contiguous 16B/lane, 8 instructions. Reads all 4096 B explicitly, so the
-//     count is right whatever the granularity -- but if a line really crosses
-//     as 128 B, then the 8 lanes sharing a line make 7/8 of the loads redundant
-//     for fabric purposes while still costing SM issue slots.
-//   1 128B stride, 1 instruction: one 4B load per line, 32 lanes -> 32 lines.
-//     Correct only if a 4B load really drags the whole 128 B across.
-// Comparing them at a large NVHBI_BUF_MULT settles it:
-//   equal read_GBps      -> 128 B granularity, and stride is 8x cheaper to issue
-//   stride ~4x higher    -> 32 B sectors, stride overcounts by 4
-#ifndef NVHBI_READ_PATTERN
-#define NVHBI_READ_PATTERN 0
-#endif
-#if   NVHBI_READ_OP == 2
-#define NVHBI_LDOP "cs"
-#elif NVHBI_READ_OP == 1
-#define NVHBI_LDOP "cv"
-#else
-#define NVHBI_LDOP "cg"
-#endif
-
-__device__ __forceinline__ void nvhbi_ld4(const unsigned int* addr,
-                                          unsigned int& a, unsigned int& b,
-                                          unsigned int& c, unsigned int& d) {
-    asm volatile("ld.global." NVHBI_LDOP ".v4.u32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(a), "=r"(b), "=r"(c), "=r"(d) : "l"(addr));
-}
+// L1-bypassing 4B load. One per 128B line is all it takes to pull the line.
 __device__ __forceinline__ unsigned int nvhbi_ld1(const unsigned int* addr) {
     unsigned int v;
-    asm volatile("ld.global." NVHBI_LDOP ".u32 %0, [%1];" : "=r"(v) : "l"(addr));
+    asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(v) : "l"(addr));
     return v;
 }
 
-// Pull one 4KiB chunk. Both shapes count 4 sectors per lane.
-__device__ __forceinline__ unsigned int nvhbi_read_chunk(const unsigned int* data,
-                                                         unsigned int cidx,
-                                                         unsigned int lane) {
-    unsigned int acc = 0u;
-#if NVHBI_READ_PATTERN == 1
-    acc = nvhbi_ld1(&data[cidx + 32u * lane]);      // byte 128*lane: one line per lane
-#else
-#pragma unroll
-    for (unsigned int k = 0; k < 8u; ++k) {
-        unsigned int a, b, c, d;
-        nvhbi_ld4(&data[cidx + 128u * k + 4u * lane], a, b, c, d);
-        acc += a + b + c + d;
-    }
-#endif
-    return acc;
-}
-
 /* ---------------------------------------------------------------------------
-   One launch, two roles. Writers push A->B, readers pull A->B. Both count in
-   32B sectors, so the two counters are directly addable.
+   One launch, two roles, split by which die the SM sits on. Writers push A->B,
+   readers pull A->B. Both count in 32B sectors so the counters simply add.
    --------------------------------------------------------------------------- */
 __global__ void nvhbi_dual(unsigned int* __restrict__ data,
                            const unsigned int* __restrict__ far_idx,
@@ -150,8 +113,7 @@ __global__ void nvhbi_dual(unsigned int* __restrict__ data,
     const unsigned long long t0 = clock64();
 
     if (is_writer) {
-        // Writers on die A target die B: the "far from SM0" list when A is
-        // partition 0, the "near" list otherwise.
+        // Writers on die A target die B: "far from SM0" when A is partition 0.
         const unsigned int* list = (wp == 0u) ? far_idx : near_idx;
         unsigned int val = smid * 1000003u + threadIdx.x + 1u;
 #pragma unroll 1
@@ -168,18 +130,20 @@ __global__ void nvhbi_dual(unsigned int* __restrict__ data,
         if (w_prog && lane == 0u && done) atomicAdd(w_prog, done * lanes);
     } else {
         if (r_count == 0u) return;
-        // Readers on die B pull from die A (or from die B itself for the
-        // no-crossing control). Each active warp starts on its own chunk and
-        // advances by the number of active warps, so together they sweep the
-        // list linearly and revisit a chunk only after a full pass.
+        // Readers on die B pull from die A (or from die B for the control).
+        // Each active warp starts on its own chunk and advances by the number
+        // of active warps, so together they sweep the list linearly and revisit
+        // a chunk only after a full pass -- by which time its replica is gone.
         const unsigned int* list = r_local ? ((wp == 0u) ? far_idx  : near_idx)
                                            : ((wp == 0u) ? near_idx : far_idx);
         const unsigned int nwarps = wpb * nbps * r_active_sm;
         unsigned int c = (slot >= r_count) ? (slot % r_count) : slot;
 #pragma unroll 1
         for (unsigned int it = 0; ; ++it) {
-            acc += nvhbi_read_chunk(data, list[c], lane);
-            done += 4ull;                  // 4096 B per warp = 4 sectors per lane
+            // byte 128*lane: 32 lanes cover the 32 lines of the 4KiB chunk,
+            // one instruction, 4 sectors pulled per lane.
+            acc += nvhbi_ld1(&data[list[c] + 32u * lane]);
+            done += 4ull;
             c += nwarps;
             if (c >= r_count) c = (c >= 2u * r_count) ? (c % r_count) : (c - r_count);
             if ((it & NVHBI_POLL_MASK) == NVHBI_POLL_MASK) {
@@ -225,15 +189,11 @@ int main(int argc, char** argv) {
     const unsigned int window_ms = env_u("NVHBI_WINDOW_MS", 200u);
     const unsigned int repeat    = env_u("NVHBI_REPEAT", 3u);
     const unsigned int r_local   = env_u("NVHBI_R_LOCAL", 0u);
-    // Big by default. At buf_mult=8 the sweep was 506 MB, only 8x one die's L2,
-// and that was not enough: the LOCAL control read 12.2 TB/s, about 3x what a
-// single die's HBM can supply, so most of it was still L2 hits. 32 gives ~2 GB
-// per die, ~32x the per-die L2.
-    const double       buf_mult  = (double)env_u("NVHBI_BUF_MULT", 32u);
+    const double       buf_mult  = (double)env_u("NVHBI_BUF_MULT", 64u);
 
     unsigned int w_list[16], r_list[16];
     const int w_n = parse_list("NVHBI_W_SMS", "0,70", w_list, 16);
-    const int r_n = parse_list("NVHBI_R_SMS", "0,16,32,64,78", r_list, 16);
+    const int r_n = parse_list("NVHBI_R_SMS", "0,8,16,32,64,78", r_list, 16);
 
     NvhbiTopo t;
     nvhbi_probe(t, 0, buf_mult);
@@ -243,8 +203,8 @@ int main(int argc, char** argv) {
     for (int i = 0; i < w_n; ++i) if (w_list[i] > w_max) w_list[i] = w_max;
     for (int i = 0; i < r_n; ++i) if (r_list[i] > r_max) r_list[i] = r_max;
 
-    const unsigned int w_target_die = rp;                       // writers push to die B
-    const unsigned int r_source_die = r_local ? rp : wp;        // readers pull from die A
+    const unsigned int w_target_die = rp;
+    const unsigned int r_source_die = r_local ? rp : wp;
     const unsigned int* d_wlist = (w_target_die == 1u) ? t.d_far_idx : t.d_near_idx;
     const unsigned int  r_avail = (r_source_die == 1u) ? t.far_count : t.near_count;
 
@@ -255,21 +215,13 @@ int main(int argc, char** argv) {
     for (int i = 0; i < w_n; ++i)
         w_max_chunks = max(w_max_chunks, nvhbi_chunks_used(w_list[i], nbps, block, 1u));
 
-    printf("dual-source load on the die%u -> die%u direction (single fused kernel)\n", wp, rp);
-    printf("  writers: die%u SMs -> die%u memory, %u chunks (%.1f MB), warmed\n",
+    printf("die%u -> die%u direction, two payload sources, one fused kernel\n", wp, rp);
+    printf("  writers: die%u SMs -> die%u L2,  %u chunks (%.1f MB), warmed\n",
            wp, w_target_die, w_max_chunks, w_max_chunks * 4096.0 / 1048576.0);
-    printf("  readers: die%u SMs <- die%u memory, streaming %u chunks (%.1f MB = %.1fx per-die L2)%s\n",
+    printf("  readers: die%u SMs <- die%u HBM, streaming %u chunks (%.1f MB = %.0fx per-die L2)%s\n",
            rp, r_source_die, r_chunks, r_chunks * 4096.0 / 1048576.0,
            r_chunks * 4096.0 / (t.l2_bytes / 2.0),
-           r_local ? "  [LOCAL CONTROL: crosses nothing]" : "");
-    printf("  loads: ld.global.%s, %s\n", NVHBI_LDOP,
-           NVHBI_READ_PATTERN == 1 ? "128B stride (1 instr/chunk)"
-                                   : "contiguous 16B/lane (8 instr/chunk)");
-    // A read served from one die's HBM cannot beat that die's HBM bandwidth.
-    // Anything far above it is L2 reuse, not fabric traffic, so print the bar.
-    printf("  NOTE: reads come from ONE die's HBM. Anything far above that die's\n"
-           "        HBM bandwidth (~half the GPU's) is L2 reuse, not crossing --\n"
-           "        raise NVHBI_BUF_MULT until read_GBps stops falling.\n");
+           r_local ? "   [CONTROL: crosses nothing]" : "");
     printf("# CFG,w_sms,r_sms,r_local,rep,write_GBps,read_GBps,total_GBps\n");
 
     cudaStream_t s;
@@ -290,7 +242,7 @@ int main(int argc, char** argv) {
         for (unsigned int rep = 0; rep < repeat; ++rep) {
             nvhbi_flush_l2(t);
             // Only the write targets are warmed. The read sweep is far larger
-            // than L2 by construction, so it comes from the source die anyway.
+            // than L2 by construction, so it comes from the source die's HBM.
             if (w_chunks) {
                 nvhbi_warm_chunks<<<t.sm_count * 8, 128>>>(
                     t.d_data, d_wlist, 0u, w_chunks, t.d_sm_side, w_target_die, t.d_sink);
