@@ -25,6 +25,7 @@ import argparse
 import csv
 import io
 import os
+import re
 import sys
 from collections import defaultdict
 from statistics import median
@@ -85,6 +86,26 @@ def i(row, key):
         return -1
 
 
+# The peer kernel's block size is fixed in nvhbi_exp23_peer.cu and is not in the
+# CSV, so the axis label has to carry it from here.
+PEER_BLOCK_THREADS = 128
+
+
+def peer_gpu_sms(session_dir, stem, default=148):
+    """SM count of the injecting GPU, for the exp2/3 grid-size axis label.
+
+    Not a CSV column, so it comes from the run log's probe line. Both GPUs in
+    these sessions are the same part, and the probe only prints gpu0.
+    """
+    log_path = os.path.join(session_dir, stem + ".log")
+    if os.path.exists(log_path):
+        for line in open(log_path):
+            m = re.search(r"SMs=(\d+)", line)
+            if m:
+                return int(m.group(1))
+    return default
+
+
 def sm_ticks(ax, allx):
     """Linear SM axis, ticked every 10."""
     top = max(allx) if allx else 0
@@ -92,8 +113,19 @@ def sm_ticks(ax, allx):
     ax.set_xticks(list(range(0, int(top) + 11, 10)))
 
 
+# exp1 sweeps two writing dies and (optionally) several blocks-per-SM values.
+# The figure fixes both so that block_size is the only series left: mixing the
+# writing die into the same axes doubled every curve and made the block_size
+# comparison unreadable.
+EXP1_WRITER_PARTITION = 1
+EXP1_BLOCKS_PER_SM = 32
+
+
 def plot_exp1(rows, outdir):
-    """One figure per die target: x = #SMs, y = throughput in TB/s."""
+    """One figure per die target: x = #SMs, y = throughput in TB/s.
+
+    One line per block_size, at a single writing die and a single blocks-per-SM.
+    """
     if not rows:
         print("exp1: no rows, skipping")
         return
@@ -106,54 +138,36 @@ def plot_exp1(rows, outdir):
         (1, "exp1_local_l2_write.png",
          "Local L2 write (own die, no fabric hop)"),
     ):
-        sel = [r for r in rows if i(r, "own_die") == own_die]
+        sel = [r for r in rows
+               if i(r, "own_die") == own_die
+               and i(r, "writer_partition") == EXP1_WRITER_PARTITION
+               and i(r, "num_blocks_per_sm") == EXP1_BLOCKS_PER_SM]
         if not sel:
+            print(f"exp1: no rows for own_die={own_die}, "
+                  f"writers on die{EXP1_WRITER_PARTITION}, "
+                  f"{EXP1_BLOCKS_PER_SM} blocks/SM -- skipping")
             continue
 
-        # group[(block_size, writer_partition)][sm] -> median GB/s over repeats
-        group = defaultdict(lambda: defaultdict(list))
+        group = defaultdict(lambda: defaultdict(list))   # [block_size][sm] -> GB/s
         for r in sel:
-            group[(i(r, "block_size"), i(r, "writer_partition"))][
-                i(r, "num_active_sm")].append(f(r, ycol))
+            group[i(r, "block_size")][i(r, "num_active_sm")].append(f(r, ycol))
 
         fig, ax = plt.subplots(figsize=(7.2, 5.0))
-        block_sizes = sorted({k[0] for k in group})
-        partitions = sorted({k[1] for k in group})
         cmap = plt.get_cmap("tab10")
-        # colour = block_size (the series the question asks for)
-        # dash    = writer partition, so both dies stay on one figure
-        styles = {p: st for p, st in zip(partitions, ["-", "--", ":", "-."])}
+        for ci, bs in enumerate(sorted(group)):
+            series = group[bs]
+            xs = sorted(series)
+            ys = [median(series[x]) / 1000.0 for x in xs]     # GB/s -> TB/s
+            ax.plot(xs, ys, marker="o", markersize=4, color=cmap(ci % 10),
+                    label=f"block size = {bs}")
 
-        per_sm_ref = None
-        for ci, bs in enumerate(block_sizes):
-            for p in partitions:
-                series = group.get((bs, p))
-                if not series:
-                    continue
-                xs = sorted(series)
-                ys = [median(series[x]) / 1000.0 for x in xs]     # GB/s -> TB/s
-                # Spell out that the dash split is the WRITING die, not the
-                # target: reading it as own-vs-cross inverts the whole figure.
-                lbl = f"block={bs}" + (f", writers on die{p}" if len(partitions) > 1 else "")
-                ax.plot(xs, ys, marker="o", markersize=4, linestyle=styles[p],
-                        color=cmap(ci % 10), label=lbl)
-                if per_sm_ref is None and xs and xs[0] > 0:
-                    per_sm_ref = ys[0] / xs[0]
-
-        # Perfect scaling from the 1-SM rate. On linear axes this is the straight
-        # line the curves would follow if nothing saturated, so the gap between a
-        # curve and this line is exactly what the fabric is refusing to carry.
         allx = sorted({x for g in group.values() for x in g})
-        if per_sm_ref:
-            ax.plot(allx, [per_sm_ref * x for x in allx], color="0.45",
-                    linestyle=":", linewidth=1.4, zorder=0,
-                    label=f"ideal linear ({per_sm_ref * 1000:.0f} GB/s per SM)")
-
         sm_ticks(ax, allx)
         ax.set_ylim(bottom=0)
-        ax.set_xlabel("number of writing SMs")
+        ax.set_xlabel("Number of SMs")
         ax.set_ylabel("Throughput (TB/s)")
-        ax.set_title(title)
+        ax.set_title(f"{title}\nwriters on die{EXP1_WRITER_PARTITION}, "
+                     f"{EXP1_BLOCKS_PER_SM} blocks/SM", fontsize=11)
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8, loc="upper left")
         fig.tight_layout()
@@ -163,7 +177,7 @@ def plot_exp1(rows, outdir):
         print(f"  wrote {path}")
 
 
-def plot_exp23(rows, stem, outdir):
+def plot_exp23(rows, stem, outdir, peer_sms=148):
     """Two panels, and the x axes are deliberately different.
 
     LEFT is the experiment: x is the NVLink load in GB/s, y is the background's
@@ -186,7 +200,7 @@ def plot_exp23(rows, stem, outdir):
     bg_local = i(rows[0], "bg_local")
     ovl = any(i(r, "peer_ovl") == 1 for r in rows)
     bg_mode = ("own-die background (control)" if bg_local
-               else "cross-die background (bisection probe)")
+               else "cross-die background")
     peer_desc = "peer -> FAR die" if exp == 2 else "peer -> NEAR die"
 
     bg = defaultdict(lambda: defaultdict(list))    # [bg_sms][peer_blocks]
@@ -224,14 +238,15 @@ def plot_exp23(rows, stem, outdir):
     axl.set_title("Does NVLink traffic cost the background anything?")
     axl.set_xlim(left=0)
 
-    # x = injecting warps. peer_block is fixed at 128 threads in the program.
+    # x = the peer grid size itself, i.e. how many blocks GPU1 injects with.
     for s in sms_pr:
         xs = sorted(pr[s])
         ys = [median(pr[s][x]) / 1000.0 for x in xs]
-        axr.plot([x * 4 for x in xs], ys, marker="s", markersize=4,
+        axr.plot(xs, ys, marker="s", markersize=4,
                  color=colour(s, sms_pr),
                  label=("no bg" if s == 0 else f"bg {s} SMs"))
-    axr.set_xlabel("injecting warps on GPU1  (peer_blocks x 4)")
+    axr.set_xlabel(f"Number of blocks ({peer_sms} SM, "
+                   f"block size {PEER_BLOCK_THREADS})")
     axr.set_ylabel("Throughput (TB/s)")
     axr.set_title("Where the NVLink load axis saturates")
     axr.set_xlim(left=0)
@@ -483,7 +498,8 @@ def main():
                  "exp3_bglocal0", "exp3_bglocal1"):
         rows = load_rows(args.session_dir, stem, EXP23_HEADER)
         print(f"{stem}: {len(rows)} rows")
-        plot_exp23(rows, stem, outdir)
+        plot_exp23(rows, stem, outdir,
+                   peer_sms=peer_gpu_sms(args.session_dir, stem))
         summarise_exp23(rows, stem)
 
     for stem in ("exp4_bglocal0", "exp4_bglocal1", "exp4_nccl"):
