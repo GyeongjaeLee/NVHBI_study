@@ -27,6 +27,9 @@ nccl: $(NCCL_BIN)
 $(BINS): %: %.cu nvhbi_common.cuh
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
+nvhbi_dualdir: nvhbi_dualdir.cu nvhbi_common.cuh
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
 nvhbi_validate_counter: nvhbi_validate_counter.cu nvhbi_common.cuh
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
@@ -34,4 +37,4 @@ $(NCCL_BIN): $(NCCL_BIN).cu nvhbi_common.cuh
 	$(NVCC) $(NVCCFLAGS) $(NCCL_INC) -o $@ $< $(NCCL_LIB)
 
 clean:
-	rm -f $(BINS) $(NCCL_BIN) nvhbi_validate_counter
+	rm -f $(BINS) $(NCCL_BIN) nvhbi_validate_counter nvhbi_dualdir
