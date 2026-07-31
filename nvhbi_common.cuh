@@ -516,7 +516,13 @@ static void nvhbi_probe(NvhbiTopo& t, int device, double buf_mult, bool verbose 
     CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
     t.sm_count  = prop.multiProcessorCount;
     t.l2_bytes  = (size_t)prop.l2CacheSize;
-    t.clock_khz = prop.clockRate;
+    // cudaDeviceProp::clockRate was removed in CUDA 13; the attribute query is
+    // the portable spelling and returns the same kHz value.
+    {
+        int khz = 0;
+        CHECK_CUDA(cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, device));
+        t.clock_khz = khz;
+    }
     t.num_ints  = (size_t)(t.l2_bytes * buf_mult) / sizeof(unsigned int);
     t.num_ints  = (t.num_ints / NVHBI_CHUNK_INTS) * NVHBI_CHUNK_INTS;
 

@@ -109,6 +109,8 @@ int main(int argc, char** argv) {
     if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) CHECK_CUDA(pe);
     cudaDeviceProp prop1{};
     CHECK_CUDA(cudaGetDeviceProperties(&prop1, 1));
+    int prop1_clock_khz = 0;   // clockRate left cudaDeviceProp in CUDA 13
+    CHECK_CUDA(cudaDeviceGetAttribute(&prop1_clock_khz, cudaDevAttrClockRate, 1));
 
     /* -------- GPU1-side copies of BOTH chunk lists (for calibration+peer) -------- */
     unsigned int* d_near1 = nullptr;   // die-0 chunk offsets, on GPU1
@@ -239,7 +241,7 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaDeviceSynchronize());
         CHECK_CUDA(cudaSetDevice(1));
         CHECK_CUDA(cudaMemset(d_peer_prog, 0, sizeof(unsigned long long)));
-        const unsigned long long dl = (unsigned long long)window_ms * (unsigned long long)prop1.clockRate;
+        const unsigned long long dl = (unsigned long long)window_ms * (unsigned long long)prop1_clock_khz;
         CHECK_CUDA(cudaEventRecord(pe0, s_peer));
         nvhbi_peer_write<<<t.sm_count * 32, 128, 0, s_peer>>>(
             t.d_data, die_list1(die), 0u, cnt, 0u, dl, d_peer_prog, d_sink1);
@@ -498,7 +500,7 @@ int main(int argc, char** argv) {
                 CHECK_CUDA(cudaSetDevice(1));
                 CHECK_CUDA(cudaMemset(d_peer_prog, 0, sizeof(unsigned long long)));
                 const unsigned long long pdl =
-                    (unsigned long long)window_ms * (unsigned long long)prop1.clockRate;
+                    (unsigned long long)window_ms * (unsigned long long)prop1_clock_khz;
                 CHECK_CUDA(cudaEventRecord(pe0, s_peer));
                 nvhbi_peer_write<<<pb, peer_block, 0, s_peer>>>(
                     t.d_data, d_peer_idx, peer_first, peer_chunks, 0u, pdl, d_peer_prog, d_sink1);
