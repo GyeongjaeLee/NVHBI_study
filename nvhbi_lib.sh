@@ -10,7 +10,12 @@ nvhbi_detect_gpu() {
     return 1
   fi
   shopt -s nocasematch
-  if [[ "$NVHBI_GPU_NAME" == *"B200"* || "$NVHBI_GPU_NAME" == *"GB200"* ]]; then
+  if [[ "$NVHBI_GPU_NAME" == *"B300"* || "$NVHBI_GPU_NAME" == *"GB300"* ]]; then
+    # B300/Blackwell-Ultra: compute capability not assumed here. Default to 100
+    # and let ARCH= override if nvcc rejects it (e.g. ARCH=103).
+    NVHBI_ARCH="${ARCH:-100}"
+    echo "NOTE: B300 detected; building for sm_$NVHBI_ARCH (override with ARCH= if nvcc errors)." >&2
+  elif [[ "$NVHBI_GPU_NAME" == *"B200"* || "$NVHBI_GPU_NAME" == *"GB200"* ]]; then
     NVHBI_ARCH="100"
   elif [[ "$NVHBI_GPU_NAME" == *"H100"* ]]; then
     NVHBI_ARCH="90"
@@ -38,7 +43,11 @@ nvhbi_clock_snapshot() {
   IFS=',' read -r sm smmax mem pw pwlim temp util <<<"$row"
   sm=${sm// /}; smmax=${smmax// /}; util=${util// /}
   echo "[$tag] sm_clock=${sm}/${smmax} MHz  mem=${mem// /} MHz  power=${pw// /}/${pwlim// /} W  temp=${temp// /}C  util=${util}%"
-  if [[ "$smmax" =~ ^[0-9]+$ && "$sm" =~ ^[0-9]+$ ]] && (( sm * 100 < smmax * 80 )); then
+  # An idle GPU parks at its minimum clock (throttle reason 0x1 = GpuIdle), so a
+  # snapshot taken before any kernel runs always looks throttled. Only warn when
+  # something was actually running.
+  if [[ "$smmax" =~ ^[0-9]+$ && "$sm" =~ ^[0-9]+$ && "$util" =~ ^[0-9]+$ ]] \
+     && (( util > 5 )) && (( sm * 100 < smmax * 80 )); then
     echo "[$tag] WARNING: SM clock is under 80% of max -- bandwidth numbers from this" >&2
     echo "[$tag]          run are not comparable with runs at full clock." >&2
     nvidia-smi -i "$gid" --query-gpu=clocks_event_reasons.active --format=csv,noheader 2>/dev/null \

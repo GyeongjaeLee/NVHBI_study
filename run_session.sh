@@ -74,7 +74,11 @@ NVHBI_SMS=999 NVHBI_BLOCK_SIZES=64 NVHBI_OWN_DIE=0,1 \
   CSV_OUT="$GATE_CSV" ./run_exp1_bisection.sh 2 > "$OUTDIR/gate.log" 2>&1 || {
     echo "gate FAILED -- see $OUTDIR/gate.log" >&2; exit 1; }
 
-awk -F',' 'NR>1 {printf "  wp=%s own_die=%s  %s SMs  %8.1f GB/s   eff_GHz %s\n",$1,$2,$3,$12,$14}' "$GATE_CSV"
+awk -F',' 'NR>1 {printf "  wp=%s own_die=%s  %s SMs  slope %8.1f  counted %8.1f  ratio %s\n",$1,$2,$3,$12,$13,$14}' "$GATE_CSV"
+if [[ $(wc -l < "$GATE_CSV") -le 1 ]]; then
+  echo "  ERROR: gate produced no rows. NVHBI_SMS may name a count this GPU does not have." >&2
+  exit 1
+fi
 CROSS_MAX=$(awk -F',' 'NR>1 && $2==0 {if ($12+0 > m) m=$12+0} END {printf "%.0f", m}' "$GATE_CSV")
 OWN_MAX=$(awk -F',' 'NR>1 && $2==1 {if ($12+0 > m) m=$12+0} END {printf "%.0f", m}' "$GATE_CSV")
 echo "  cross-die max: $CROSS_MAX GB/s   own-die max: $OWN_MAX GB/s"

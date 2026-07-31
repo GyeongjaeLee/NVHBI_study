@@ -329,11 +329,13 @@ __global__ void nvhbi_stress_write(unsigned int* __restrict__ data,
     }
 
     if (progress && lane == 0u && done) atomicAdd(progress, done * lanes);
-    // One designated thread reports the cycles it spent in the loop. Comparing
-    // that against the wall-clock ms gives the SM clock actually achieved, which
-    // is the only way to tell a slower fabric from a throttled GPU.
-    if (cycles_out && sm_rank == 0u && threadIdx.x == 0u && blockIdx.x < sm_count)
-        *cycles_out = (unsigned long long)(clock64() - t0);
+    // Longest loop span over all participating warps, which tracks the kernel's
+    // own busy time. A single designated thread did NOT: it reported 0.50-1.49
+    // GHz on a GPU nvidia-smi held pinned at 1.965 GHz, and the figure halved
+    // when block_size doubled, because that one thread stops representing the
+    // kernel as soon as occupancy changes. Callers must zero *cycles_out first.
+    if (cycles_out && lane == 0u)
+        atomicMax(cycles_out, (unsigned long long)(clock64() - t0));
     nvhbi_st(&sink[smid], val);
 }
 

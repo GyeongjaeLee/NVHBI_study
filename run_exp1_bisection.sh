@@ -32,7 +32,7 @@ PROG="nvhbi_exp1_bisection"
 CSV_OUT="${CSV_OUT:-exp1_bisection.csv}"
 PARTITION="${1:-2}"
 
-CFG_HEADER="writer_partition,own_die,num_active_sm,num_blocks_per_sm,block_size,footprint_MB,sectors_lo,sectors_hi,ms_lo,ms_hi,naive_GBps,slope_GBps,overhead_ms,eff_GHz"
+CFG_HEADER="writer_partition,own_die,num_active_sm,num_blocks_per_sm,block_size,footprint_MB,sectors_lo,sectors_hi,ms_lo,ms_hi,naive_GBps,slope_GBps,counted_GBps,count_ratio,overhead_ms,eff_GHz"
 
 nvhbi_detect_gpu "$GPU_ID"
 nvhbi_build "$PROG"

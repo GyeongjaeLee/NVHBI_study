@@ -106,7 +106,7 @@ int main(int argc, char** argv) {
     printf("  two-point slope: iteration %u vs %u\n", iter_lo, iter_hi);
     printf("# CFG,writer_partition,own_die,num_active_sm,num_blocks_per_sm,block_size,"
            "footprint_MB,sectors_lo,sectors_hi,ms_lo,ms_hi,"
-           "naive_GBps,slope_GBps,overhead_ms,eff_GHz\n");
+           "naive_GBps,slope_GBps,counted_GBps,count_ratio,overhead_ms,eff_GHz\n");
 
     const unsigned int p_lo = (arg_partition <= 1u) ? arg_partition : 0u;
     const unsigned int p_hi = (arg_partition <= 1u) ? arg_partition : 1u;
@@ -116,6 +116,12 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaEventCreate(&e1));
     unsigned long long* d_cycles = nullptr;
     CHECK_CUDA(cudaMalloc(&d_cycles, sizeof(unsigned long long)));
+    // exp1 derives bytes analytically (nsm x nbps x block_size x 4 x iteration)
+    // while exp2/3 count the stores the kernel really issued. The two agree
+    // exactly in the linear region but diverge ~20% once the fabric saturates,
+    // so count here too and publish the ratio rather than assume.
+    unsigned long long* d_prog = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_prog, sizeof(unsigned long long)));
 
     for (unsigned int wp = p_lo; wp <= p_hi; ++wp) {
     for (int oi = 0; oi < od_n; ++oi) {
@@ -131,8 +137,16 @@ int main(int argc, char** argv) {
         unsigned int sm_list[32];
         int sm_n = 0;
         if (sm_env_n > 0) {
-            for (int i = 0; i < sm_env_n; ++i)
-                if (sm_env[i] > 0 && sm_env[i] <= max_sms) sm_list[sm_n++] = sm_env[i];
+            // Clamp, do not drop. NVHBI_SMS=999 used to silently produce an
+            // empty sweep here while exp23 clamped the same value, so "999 means
+            // max" held in one program and not the other.
+            for (int i = 0; i < sm_env_n; ++i) {
+                if (sm_env[i] == 0u) continue;
+                unsigned int v = (sm_env[i] > max_sms) ? max_sms : sm_env[i];
+                bool dup = false;
+                for (int k = 0; k < sm_n; ++k) if (sm_list[k] == v) dup = true;
+                if (!dup) sm_list[sm_n++] = v;
+            }
         } else {
             for (unsigned int s = 1; s <= max_sms; s *= 2) sm_list[sm_n++] = s;
             if (sm_n == 0 || sm_list[sm_n - 1] != max_sms) sm_list[sm_n++] = max_sms;
@@ -155,6 +169,7 @@ int main(int argc, char** argv) {
             dim3 grid(t.sm_count * nbps), block(block_size);
             float ms[2] = {0.f, 0.f};
             unsigned long long cyc[2] = {0ull, 0ull};
+            unsigned long long cnt[2] = {0ull, 0ull};
             const unsigned int iters[2] = {iter_lo, iter_hi};
 
             for (int k = 0; k < 2; ++k) {
@@ -166,18 +181,22 @@ int main(int argc, char** argv) {
                 CHECK_CUDA(cudaGetLastError());
                 CHECK_CUDA(cudaDeviceSynchronize());
 
+                CHECK_CUDA(cudaMemset(d_cycles, 0, sizeof(unsigned long long)));
+                CHECK_CUDA(cudaMemset(d_prog, 0, sizeof(unsigned long long)));
                 CHECK_CUDA(cudaEventRecord(e0));
                 nvhbi_stress_write<<<grid, block>>>(
                     t.d_data, t.d_far_idx, t.d_near_idx, t.d_sm_side,
                     wp, own_die, nsm, nbps, (unsigned int)t.sm_count,
                     /*lines_mult=*/1u, /*chunk_offset=*/0u,
                     iters[k], /*deadline=*/0ull, /*stop_flag=*/nullptr,
-                    /*progress=*/nullptr, d_cycles, t.d_sink);
+                    d_prog, d_cycles, t.d_sink);
                 CHECK_CUDA(cudaEventRecord(e1));
                 CHECK_CUDA(cudaGetLastError());
                 CHECK_CUDA(cudaDeviceSynchronize());
                 CHECK_CUDA(cudaEventElapsedTime(&ms[k], e0, e1));
                 CHECK_CUDA(cudaMemcpy(&cyc[k], d_cycles, sizeof(cyc[k]),
+                                      cudaMemcpyDeviceToHost));
+                CHECK_CUDA(cudaMemcpy(&cnt[k], d_prog, sizeof(cnt[k]),
                                       cudaMemcpyDeviceToHost));
             }
 
@@ -190,16 +209,20 @@ int main(int argc, char** argv) {
 
             const double dt = (ms[1] - ms[0]) * 1e-3;
             const double slope_gbps = (dt > 0.0) ? (sec_hi - sec_lo) * 32.0 / dt / 1e9 : 0.0;
+            // Same slope, but on the sectors the kernel reported issuing.
+            const double counted_gbps = (dt > 0.0)
+                ? (double)(cnt[1] - cnt[0]) * 32.0 / dt / 1e9 : 0.0;
+            const double count_ratio = (sec_hi > 0.0) ? (double)cnt[1] / sec_hi : 0.0;
             const double naive_gbps = (ms[1] > 0.f)
                 ? sec_hi * 32.0 / (ms[1] * 1e-3) / 1e9 : 0.0;
             const double overhead_ms = (slope_gbps > 0.0)
                 ? ms[1] - (sec_hi * 32.0 / (slope_gbps * 1e9)) * 1e3 : 0.0;
 
-            printf("CFG,%u,%u,%u,%u,%u,%.2f,%.0f,%.0f,%.4f,%.4f,%.2f,%.2f,%.4f,%.3f\n",
+            printf("CFG,%u,%u,%u,%u,%u,%.2f,%.0f,%.0f,%.4f,%.4f,%.2f,%.2f,%.2f,%.4f,%.4f,%.3f\n",
                    wp, own_die, nsm, nbps, block_size,
                    nvhbi_footprint_mb(nsm, nbps, block_size, 1u),
                    sec_lo, sec_hi, ms[0], ms[1],
-                   naive_gbps, slope_gbps, overhead_ms, eff_ghz);
+                   naive_gbps, slope_gbps, counted_gbps, count_ratio, overhead_ms, eff_ghz);
             fflush(stdout);
         }}
     }}
@@ -207,6 +230,7 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaEventDestroy(e0));
     CHECK_CUDA(cudaEventDestroy(e1));
     CHECK_CUDA(cudaFree(d_cycles));
+    CHECK_CUDA(cudaFree(d_prog));
     nvhbi_free(t);
     return 0;
 }
