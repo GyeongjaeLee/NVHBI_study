@@ -3,12 +3,16 @@
 
 Reads a session produced by run_session.sh (or the raw .log files) and writes:
 
-  exp1_remote_l2_write.png   x = #SMs, y = GB/s, one line per block_size
+  exp1_remote_l2_write.png   x = #SMs (linear, ticked every 10), y = TB/s
   exp1_local_l2_write.png    same, for own-die writes
-  exp2_bglocal0.png          x = NVLink load, y = bg GB/s and peer GB/s,
+  exp2_bglocal0.png          x = NVLink load in TB/s, y = background TB/s,
   exp2_bglocal1.png          one line per background SM count
   exp3_bglocal0.png
   exp3_bglocal1.png
+  dualdir.png                x = reader SMs, y = TB/s on the A->B direction
+  peerl2.png                 peer read latency (warm vs cold) and throughput
+
+Axes are linear throughout and throughput is reported in TB/s.
 
 Prefers <name>.csv; falls back to extracting the "CFG," rows from <name>.log,
 so it works on a directory that only has logs.
@@ -33,7 +37,9 @@ import matplotlib.pyplot as plt
 # columns by name and never by position.
 EXP1_HEADER_HINT = "writer_partition,own_die,num_active_sm"
 EXP23_HEADER = ("exp,far_die,peer_die,bg_local,bg_sms,peer_blocks,rep,"
-                "peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz")
+                "peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz,peer_ovl")
+PL2_HEADER = ("kind,die,is_far,state,cv,corun,rep,peer_cyc,local_cyc,"
+              "peer_GBps,co_GBps,chunks")
 EXP4_HEADER = "exp,bg_local,bg_sms,msg_bytes,rep,nccl_ms,algbw_GBps,busbw_GBps,bg_GBps"
 DUAL_HEADER = "w_sms,r_sms,r_local,rep,write_GBps,read_GBps,total_GBps"
 
@@ -79,8 +85,15 @@ def i(row, key):
         return -1
 
 
+def sm_ticks(ax, allx):
+    """Linear SM axis, ticked every 10."""
+    top = max(allx) if allx else 0
+    ax.set_xlim(0, top + 5)
+    ax.set_xticks(list(range(0, int(top) + 11, 10)))
+
+
 def plot_exp1(rows, outdir):
-    """One figure per die target: x = #SMs, y = GB/s, line per block_size."""
+    """One figure per die target: x = #SMs, y = throughput in TB/s."""
     if not rows:
         print("exp1: no rows, skipping")
         return
@@ -118,7 +131,7 @@ def plot_exp1(rows, outdir):
                 if not series:
                     continue
                 xs = sorted(series)
-                ys = [median(series[x]) for x in xs]
+                ys = [median(series[x]) / 1000.0 for x in xs]     # GB/s -> TB/s
                 # Spell out that the dash split is the WRITING die, not the
                 # target: reading it as own-vs-cross inverts the whole figure.
                 lbl = f"block={bs}" + (f", writers on die{p}" if len(partitions) > 1 else "")
@@ -127,21 +140,21 @@ def plot_exp1(rows, outdir):
                 if per_sm_ref is None and xs and xs[0] > 0:
                     per_sm_ref = ys[0] / xs[0]
 
-        # Perfect scaling from the 1-SM rate. On log-log this is a straight line,
-        # so where the curves peel off IS the saturation knee. On a linear y axis
-        # it is invisible -- everything just looks like growth.
+        # Perfect scaling from the 1-SM rate. On linear axes this is the straight
+        # line the curves would follow if nothing saturated, so the gap between a
+        # curve and this line is exactly what the fabric is refusing to carry.
+        allx = sorted({x for g in group.values() for x in g})
         if per_sm_ref:
-            allx = sorted({x for g in group.values() for x in g})
             ax.plot(allx, [per_sm_ref * x for x in allx], color="0.45",
                     linestyle=":", linewidth=1.4, zorder=0,
-                    label=f"ideal linear ({per_sm_ref:.0f} GB/s per SM)")
+                    label=f"ideal linear ({per_sm_ref * 1000:.0f} GB/s per SM)")
 
-        ax.set_xscale("log", base=2)
-        ax.set_yscale("log", base=10)
+        sm_ticks(ax, allx)
+        ax.set_ylim(bottom=0)
         ax.set_xlabel("number of writing SMs")
-        ax.set_ylabel("write bandwidth (GB/s)")
+        ax.set_ylabel("Throughput (TB/s)")
         ax.set_title(title)
-        ax.grid(True, alpha=0.3, which="both")
+        ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8, loc="upper left")
         fig.tight_layout()
         path = os.path.join(outdir, fname)
@@ -151,12 +164,19 @@ def plot_exp1(rows, outdir):
 
 
 def plot_exp23(rows, stem, outdir):
-    """Two panels: background BW and NVLink BW vs NVLink load.
+    """Two panels, and the x axes are deliberately different.
 
-    x is peer_blocks, the knob that sets how hard GPU1 injects. peer_blocks=0 is
-    the clean baseline on the background panel; bg_sms=0 is the baseline on the
-    NVLink panel. Flat lines here are the result, not a failure: neither P2P
-    kernel stores nor copy-engine DMA moved the background by more than 0.1%.
+    LEFT is the experiment: x is the NVLink load in GB/s, y is the background's
+    remaining bandwidth. The load is the peer bandwidth measured at that grid
+    size WITH NO BACKGROUND -- an offered load, so it stays an independent
+    variable. The first version of this figure put peer_blocks on x, which is a
+    grid size, not a load, and hid the real problem: every grid size from 16
+    blocks up delivered 634-645 GB/s, so the whole axis sat past saturation and
+    four points were plotted where there was really only one.
+
+    RIGHT is the diagnostic for that: x is the number of injecting warps, y is
+    what they achieved. Where that curve goes flat is where the left panel stops
+    carrying information, so read it first.
     """
     if not rows:
         print(f"{stem}: no rows, skipping")
@@ -164,6 +184,7 @@ def plot_exp23(rows, stem, outdir):
 
     exp = i(rows[0], "exp")
     bg_local = i(rows[0], "bg_local")
+    ovl = any(i(r, "peer_ovl") == 1 for r in rows)
     bg_mode = ("own-die background (control)" if bg_local
                else "cross-die background (bisection probe)")
     peer_desc = "peer -> FAR die" if exp == 2 else "peer -> NEAR die"
@@ -177,7 +198,12 @@ def plot_exp23(rows, stem, outdir):
         if pb > 0:
             pr[s][pb].append(f(r, "peer_GBps"))
 
-    fig, (axl, axr) = plt.subplots(1, 2, figsize=(12.4, 5.0))
+    # peer_blocks -> offered NVLink load in GB/s (measured with no background).
+    # Falls back to the smallest background if the bg_sms=0 row is missing.
+    ref = pr.get(0) or (pr[min(pr)] if pr else {})
+    offered = {pb: median(v) for pb, v in ref.items()}
+
+    fig, (axl, axr) = plt.subplots(1, 2, figsize=(12.8, 5.0))
     cmap = plt.get_cmap("viridis")
     sms_bg, sms_pr = sorted(bg), sorted(pr)
 
@@ -187,31 +213,115 @@ def plot_exp23(rows, stem, outdir):
         return cmap(allsms.index(s) / (len(allsms) - 1))
 
     for s in sms_bg:
-        xs = sorted(bg[s])
-        ys = [median(bg[s][x]) for x in xs]
-        axl.plot([max(x, 1) for x in xs], ys, marker="o", markersize=4,
+        pts = sorted((offered.get(pb, 0.0) / 1000.0, median(bg[s][pb]) / 1000.0)
+                     for pb in bg[s])
+        if not pts:
+            continue
+        axl.plot([p[0] for p in pts], [p[1] for p in pts], marker="o", markersize=4,
                  color=colour(s, sms_bg), label=f"bg {s} SMs")
-    axl.set_ylabel("background write bandwidth (GB/s)")
-    axl.set_title("Background BW vs NVLink load")
+    axl.set_xlabel("NVLink load offered by GPU1 (TB/s, measured with no background)")
+    axl.set_ylabel("Throughput (TB/s)")
+    axl.set_title("Does NVLink traffic cost the background anything?")
+    axl.set_xlim(left=0)
 
+    # x = injecting warps. peer_block is fixed at 128 threads in the program.
     for s in sms_pr:
         xs = sorted(pr[s])
-        ys = [median(pr[s][x]) for x in xs]
-        axr.plot(xs, ys, marker="s", markersize=4, color=colour(s, sms_pr),
+        ys = [median(pr[s][x]) / 1000.0 for x in xs]
+        axr.plot([x * 4 for x in xs], ys, marker="s", markersize=4,
+                 color=colour(s, sms_pr),
                  label=("no bg" if s == 0 else f"bg {s} SMs"))
-    axr.set_ylabel("NVLink (peer) write bandwidth (GB/s)")
-    axr.set_title("NVLink BW vs NVLink load")
+    axr.set_xlabel("injecting warps on GPU1  (peer_blocks x 4)")
+    axr.set_ylabel("Throughput (TB/s)")
+    axr.set_title("Where the NVLink load axis saturates")
+    axr.set_xlim(left=0)
 
     for ax in (axl, axr):
-        ax.set_xscale("log", base=2)
-        ax.set_xlabel("NVLink load  (peer grid blocks; 1 = none)")
-        ax.grid(True, alpha=0.3, which="both")
+        ax.grid(True, alpha=0.3)
         ax.set_ylim(bottom=0)
         ax.legend(fontsize=8)
 
-    fig.suptitle(f"exp{exp}: {peer_desc},  {bg_mode}")
+    fig.suptitle(f"exp{exp}: {peer_desc},  {bg_mode}"
+                 + ("   [peer and background on the SAME chunks]" if ovl else ""))
     fig.tight_layout()
     path = os.path.join(outdir, stem + ".png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {path}")
+
+
+def plot_peerl2(rows, outdir):
+    """Is a peer read served from GPU0's L2 or from GPU0's HBM?
+
+    Left: latency, warm vs cold, peer against the GPU0-local reference measured
+    with the identical kernel. The local pair sets the scale -- it is what an L2
+    hit and an HBM miss cost on this allocation. If the peer bars move by a
+    similar margin, GPU1 is being served by GPU0's L2; if the peer bars are flat
+    across warm/cold, it is not.
+
+    Right: bandwidth for the resident (fits in L2) and streaming (>> L2)
+    footprints, with and without GPU0 co-running on the same chunks.
+    """
+    if not rows:
+        print("peerl2: no rows, skipping")
+        return
+
+    lat = [r for r in rows if i(r, "kind") == 0]
+    bw = [r for r in rows if i(r, "kind") == 1]
+
+    fig, (axl, axr) = plt.subplots(1, 2, figsize=(12.8, 5.0))
+
+    if lat:
+        # one group per (die, cv); bars are peer/local x cold/warm
+        keys = sorted({(i(r, "die"), i(r, "cv")) for r in lat})
+        far = {i(r, "die"): i(r, "is_far") for r in lat}
+        width = 0.2
+        for gi, k in enumerate(keys):
+            die, cv = k
+            for bi_, (col, state, colour_) in enumerate((
+                    ("peer_cyc", 0, "tab:red"), ("peer_cyc", 1, "tab:orange"),
+                    ("local_cyc", 0, "tab:blue"), ("local_cyc", 1, "tab:cyan"))):
+                vals = [f(r, col) for r in lat
+                        if i(r, "die") == die and i(r, "cv") == cv
+                        and i(r, "state") == state]
+                if not vals:
+                    continue
+                axl.bar(gi + (bi_ - 1.5) * width, median(vals), width,
+                        color=colour_,
+                        label=(f"{'GPU1 peer' if col.startswith('peer') else 'GPU0 local'}"
+                               f", {'warm L2' if state else 'cold (HBM)'}")
+                        if gi == 0 else None)
+        axl.set_xticks(range(len(keys)))
+        axl.set_xticklabels([f"die{d}{' FAR' if far.get(d) else ' NEAR'}\n"
+                             f"{'ld.cv' if c else 'ld.cg'}" for d, c in keys],
+                            fontsize=8)
+        axl.set_ylabel("per-access latency (SM cycles)")
+        axl.set_title("Peer read latency: warm L2 vs cold")
+        axl.legend(fontsize=7)
+        axl.grid(True, alpha=0.3, axis="y")
+
+    if bw:
+        labels, vals = [], []
+        for r_key in sorted({(i(r, "die"), i(r, "state"), i(r, "cv"), i(r, "corun"))
+                             for r in bw}):
+            die, state, cv, corun = r_key
+            sel = [f(r, "peer_GBps") / 1000.0 for r in bw
+                   if (i(r, "die"), i(r, "state"), i(r, "cv"), i(r, "corun")) == r_key]
+            if not sel:
+                continue
+            labels.append(f"die{die} {'res' if state else 'stream'} "
+                          f"{'cv' if cv else 'cg'} co{corun}")
+            vals.append(median(sel))
+        axr.barh(range(len(vals)), vals, color="tab:green")
+        axr.set_yticks(range(len(labels)))
+        axr.set_yticklabels(labels, fontsize=7)
+        axr.set_xlabel("GPU1 peer read Throughput (TB/s)")
+        axr.set_title("Peer read bandwidth  (res = fits L2, stream = >> L2)")
+        axr.grid(True, alpha=0.3, axis="x")
+
+    fig.suptitle("peerl2: where GPU1's reads of GPU0 are served from")
+    fig.tight_layout()
+    path = os.path.join(outdir, "peerl2.png")
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"  wrote {path}")
@@ -267,23 +377,23 @@ def plot_exp4(rows, outdir):
     cmap = plt.get_cmap("viridis")
     for (loc, s), series in sorted(g.items()):
         xs = sorted(series)
-        ys = [median(series[x]) for x in xs]
+        ys = [median(series[x]) / 1000.0 for x in xs]
         col = cmap(sms.index(s) / max(len(sms) - 1, 1))
         axl.plot(xs, ys, marker="o", markersize=4, color=col,
                  linestyle="--" if loc else "-",
                  label=f"bg {s} SMs" + (" (own-die)" if loc else ""))
-    axl.set_ylabel("NCCL busbw (GB/s)")
+    axl.set_ylabel("NCCL busbw -- Throughput (TB/s)")
     axl.set_title("Collective throughput vs message size")
     axl.set_xscale("log", base=2)
 
     for (loc, s), series in sorted(bgw.items()):
         xs = sorted(series)
-        ys = [median(series[x]) for x in xs]
+        ys = [median(series[x]) / 1000.0 for x in xs]
         col = cmap(sms.index(s) / max(len(sms) - 1, 1))
         axr.plot(xs, ys, marker="s", markersize=4, color=col,
                  linestyle="--" if loc else "-",
                  label=f"bg {s} SMs" + (" (own-die)" if loc else ""))
-    axr.set_ylabel("background write bandwidth (GB/s)")
+    axr.set_ylabel("Throughput (TB/s)")
     axr.set_title("What the background gave up")
     axr.set_xscale("log", base=2)
 
@@ -327,21 +437,21 @@ def plot_dual(rows, outdir):
         series["total"][rs].append(f(r, "total_GBps"))
 
     fig, ax = plt.subplots(figsize=(7.4, 5.0))
+    allx = sorted(series["total"])
     for name, col in (("write", "tab:blue"), ("read", "tab:orange"),
                       ("total", "tab:green")):
         xs = sorted(series[name])
-        ys = [median(series[name][x]) for x in xs]
-        ax.plot([max(x, 1) for x in xs], ys, marker="o", markersize=5,
-                color=col, label=name)
+        ys = [median(series[name][x]) / 1000.0 for x in xs]
+        ax.plot(xs, ys, marker="o", markersize=5, color=col, label=name)
     solo = series["write"].get(0)
     if solo:
-        ax.axhline(median(solo), color="tab:blue", linestyle="--", linewidth=1.2,
-                   label=f"writes alone ({median(solo):.0f} GB/s)")
-    ax.set_xscale("log", base=2)
-    ax.set_xlabel("reader SMs on the far die  (1 = none)")
-    ax.set_ylabel("bandwidth on the A->B direction (GB/s)")
+        ax.axhline(median(solo) / 1000.0, color="tab:blue", linestyle="--",
+                   linewidth=1.2, label=f"writes alone ({median(solo) / 1000.0:.2f} TB/s)")
+    sm_ticks(ax, allx)
+    ax.set_xlabel("reader SMs on the far die")
+    ax.set_ylabel("Throughput on the A->B direction (TB/s)")
     ax.set_title(f"Two payload sources on one direction ({w_max} writer SMs)")
-    ax.grid(True, alpha=0.3, which="both")
+    ax.grid(True, alpha=0.3)
     ax.set_ylim(bottom=0)
     ax.legend(fontsize=9)
     fig.tight_layout()
@@ -388,6 +498,10 @@ def main():
     dual = load_rows(args.session_dir, "dualdir", DUAL_HEADER)
     print(f"dualdir: {len(dual)} rows")
     plot_dual(dual, outdir)
+
+    pl2 = load_rows(args.session_dir, "peerl2", PL2_HEADER)
+    print(f"peerl2: {len(pl2)} rows")
+    plot_peerl2(pl2, outdir)
 
 
 if __name__ == "__main__":

@@ -47,6 +47,11 @@
 //      NVHBI_BG_BLOCK / NVHBI_BG_BLOCKS_PER_SM / NVHBI_BG_LINES
 //      NVHBI_PEER_MODE          0 = GPU1 kernel P2P stores (default)
 //                               1 = cudaMemcpyPeerAsync (copy engines, die-agnostic)
+//      NVHBI_PEER_IDLE          spin cycles after each store group, 0 = full rate.
+//                               The continuous injection-rate knob; use it to get
+//                               sub-saturation points on the NVLink-load axis.
+//      NVHBI_PEER_OVERLAP       1 = peer writes the SAME chunks the background
+//                               writes, 0 (default) = a disjoint region.
 //      NVHBI_BUF_MULT           default 8
 
 #include "nvhbi_common.cuh"
@@ -99,10 +104,15 @@ int main(int argc, char** argv) {
     // distinction does not apply to it.
     const unsigned int peer_mode = env_u("NVHBI_PEER_MODE", 0u);
     const double       buf_mult  = (double)env_u("NVHBI_BUF_MULT", 8u);
+    const unsigned int peer_idle    = env_u("NVHBI_PEER_IDLE", 0u);
+    const unsigned int peer_overlap = env_u("NVHBI_PEER_OVERLAP", 0u);
 
     unsigned int bg_list[32], pk_list[32];
     const int bg_n = parse_list("NVHBI_BG_SMS_LIST", "0,16,32,64,74", bg_list, 32);
-    const int pk_n = parse_list("NVHBI_PEER_BLOCKS_LIST", "0,16,64,256,1024", pk_list, 32);
+    // Starts at 1 block. The old list started at 16 and every point from there up
+    // read 634-645 GB/s, i.e. the axis began past saturation and showed nothing.
+    const int pk_n = parse_list("NVHBI_PEER_BLOCKS_LIST",
+                                "0,1,2,4,8,16,64,256,1024", pk_list, 32);
 
     int ndev = 0;
     CHECK_CUDA(cudaGetDeviceCount(&ndev));
@@ -259,7 +269,7 @@ int main(int argc, char** argv) {
         const unsigned long long dl = (unsigned long long)window_ms * (unsigned long long)prop1_clock_khz;
         CHECK_CUDA(cudaEventRecord(pe0, s_peer));
         nvhbi_peer_write<<<t.sm_count * 32, 128, 0, s_peer>>>(
-            t.d_data, die_list1(die), 0u, cnt, 0u, dl, d_peer_prog, d_sink1);
+            t.d_data, die_list1(die), 0u, cnt, 0u, dl, 0u, d_peer_prog, d_sink1);
         CHECK_CUDA(cudaEventRecord(pe1, s_peer));
         CHECK_CUDA(cudaStreamSynchronize(s_peer));
         float ms = 0.f; CHECK_CUDA(cudaEventElapsedTime(&ms, pe0, pe1));
@@ -358,7 +368,17 @@ int main(int argc, char** argv) {
 
     const unsigned int  peer_avail = die_count(peer_die);
     const unsigned int* d_peer_own = (peer_die == 1u) ? t.d_far_idx : t.d_near_idx;
-    const unsigned int  peer_first = (peer_die == bg_target_die) ? bg_reserve : 0u;
+    // Default: step past the background's chunks so the two never touch the same
+    // line. NVHBI_PEER_OVERLAP=1 puts them on the SAME chunks instead, which is a
+    // different question -- not "do two streams share the fabric" but "what does
+    // the coherence/L2 machinery do when both dies write the same lines". Only
+    // meaningful when both are aimed at the same die.
+    const bool peer_ovl = peer_overlap && (peer_die == bg_target_die);
+    if (peer_overlap && !peer_ovl)
+        fprintf(stderr, "note: NVHBI_PEER_OVERLAP ignored -- peer targets die%u but the "
+                        "background targets die%u, so there is nothing to overlap\n",
+                peer_die, bg_target_die);
+    const unsigned int  peer_first = (peer_ovl || peer_die != bg_target_die) ? 0u : bg_reserve;
     unsigned int peer_chunks = peer_chunks_req;
     if (peer_first + peer_chunks > peer_avail)
         peer_chunks = (peer_avail > peer_first) ? (peer_avail - peer_first) : 0u;
@@ -369,9 +389,11 @@ int main(int argc, char** argv) {
     printf("  background: die%u SMs -> die%u (%s), up to %u SMs\n",
            bg_writer_partition, bg_target_die,
            bg_local ? "OWN die = control" : "cross-die = bisection probe", bg_max);
-    printf("  peer region: chunks [%u,%u) on die%u -> %.1f MB\n\n",
+    printf("  peer region: chunks [%u,%u) on die%u -> %.1f MB%s\n",
            peer_first, peer_first + peer_chunks, peer_die,
-           peer_chunks * (double)NVHBI_CHUNK_BYTES / (1024.0 * 1024.0));
+           peer_chunks * (double)NVHBI_CHUNK_BYTES / (1024.0 * 1024.0),
+           peer_ovl ? "   [OVERLAPPING the background's chunks]" : "");
+    printf("  peer stores: %u idle cycles per store group\n\n", peer_idle);
 
     /* -------- background machinery on GPU0 -------- */
     if (peer_mode == 1u) {
@@ -450,8 +472,10 @@ int main(int argc, char** argv) {
         printf("\n");
     }
 
+    // New columns are APPENDED, never inserted: the run scripts' awk still
+    // addresses the old ones by position.
     printf("# CFG,exp,far_die,peer_die,bg_local,bg_sms,peer_blocks,rep,"
-           "peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz\n");
+           "peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz,peer_ovl\n");
 
     for (int bi = 0; bi < bg_n; ++bi) {
     for (int pi = 0; pi < pk_n; ++pi) {
@@ -549,7 +573,8 @@ int main(int argc, char** argv) {
                     (unsigned long long)window_ms * (unsigned long long)prop1_clock_khz;
                 CHECK_CUDA(cudaEventRecord(pe0, s_peer));
                 nvhbi_peer_write<<<pb, peer_block, 0, s_peer>>>(
-                    t.d_data, d_peer_idx, peer_first, peer_chunks, 0u, pdl, d_peer_prog, d_sink1);
+                    t.d_data, d_peer_idx, peer_first, peer_chunks, 0u, pdl,
+                    peer_idle, d_peer_prog, d_sink1);
                 CHECK_CUDA(cudaEventRecord(pe1, s_peer));
                 CHECK_CUDA(cudaGetLastError());
                 CHECK_CUDA(cudaStreamSynchronize(s_peer));
@@ -590,9 +615,10 @@ int main(int argc, char** argv) {
             const double crossing = (bg_local ? 0.0 : bg_gbps)
                                   + ((exp == 2u) ? peer_gbps : 0.0);
 
-            printf("CFG,%u,%u,%u,%u,%u,%u,%u,%.4f,%.2f,%.2f,%.2f,%.3f\n",
+            printf("CFG,%u,%u,%u,%u,%u,%u,%u,%.4f,%.2f,%.2f,%.2f,%.3f,%u\n",
                    exp, far_die, peer_die, bg_local, bg_sms, pb, rep,
-                   peer_ms, peer_gbps, bg_gbps, crossing, bg_ghz);
+                   peer_ms, peer_gbps, bg_gbps, crossing, bg_ghz,
+                   peer_ovl ? 1u : 0u);
             fflush(stdout);
         }
     }}

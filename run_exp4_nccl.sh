@@ -41,10 +41,24 @@ if [[ "$ndev" -lt 2 ]]; then
 fi
 
 nvhbi_detect_gpu 0
+
+nvhbi_find_nccl || true
+
 if ! nvhbi_build "$PROG"; then
   echo >&2
-  echo "Build failed. If NCCL headers/libs were not found, point NCCL_HOME at them:" >&2
+  echo "exp4 build failed. Everything else in this study builds without NCCL;" >&2
+  echo "only exp4 needs it. To diagnose:" >&2
+  echo >&2
+  echo "  make -f Makefile.nvhbi nccl-probe            # what the build would use" >&2
+  echo "  find / -name nccl.h 2>/dev/null              # is the header anywhere?" >&2
+  echo "  ldconfig -p | grep nccl                      # is the library installed?" >&2
+  echo >&2
+  echo "Then point NCCL_HOME at the tree that holds include/nccl.h and lib/libnccl.so*:" >&2
   echo "  NCCL_HOME=/path/to/nccl ./run_exp4_nccl.sh" >&2
+  echo >&2
+  echo "If nothing is installed, either" >&2
+  echo "  apt-get install -y libnccl2 libnccl-dev      # needs the CUDA apt repo" >&2
+  echo "  pip install nvidia-nccl-cu12                 # then re-run; auto-detected" >&2
   exit 1
 fi
 

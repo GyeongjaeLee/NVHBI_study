@@ -65,6 +65,29 @@ nvhbi_build() {
   make -f Makefile.nvhbi ARCH="$NVHBI_ARCH" "$target"
 }
 
+# Set NCCL_HOME if it is not already set and NCCL can be found. Only exp4 needs
+# it; everything else builds without. Looks in the places NCCL actually turns up
+# on these images: the distro package, the CUDA tree, and the pip wheel
+# (nvidia-nccl-cu*, which is what a PyTorch image ships -- note it has no
+# unversioned libnccl.so, which is why plain -lnccl fails against it).
+nvhbi_find_nccl() {
+  [[ -n "${NCCL_HOME:-}" ]] && return 0
+  local cand
+  for cand in \
+      /usr /usr/local /usr/local/cuda \
+      "$(python3 -c 'import os,nvidia.nccl as n; print(os.path.dirname(n.__file__))' 2>/dev/null)" \
+      $(ls -d /usr/local/nccl* /opt/nccl* 2>/dev/null)
+  do
+    [[ -z "$cand" ]] && continue
+    if [[ -f "$cand/include/nccl.h" ]] && compgen -G "$cand/lib*/libnccl.so*" >/dev/null; then
+      export NCCL_HOME="$cand"
+      echo "found NCCL at $NCCL_HOME"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # nvhbi_cfg_rows <file> <expected_field_count>
 # Program config rows look like "CFG,<fields>"; the "# CFG,..." header is skipped.
 nvhbi_cfg_rows() {

@@ -102,7 +102,7 @@ echo "  -> $OUTDIR/exp1.csv ($(( $(wc -l < "$OUTDIR/exp1.csv") - 1 )) rows)"
 nvhbi_clock_snapshot "after-exp1" "$GPU_ID" | tee -a "$MANIFEST"
 
 # ---------------------------------------------------------------- exp2/3
-EXP23_HEADER="exp,far_die,peer_die,bg_local,bg_sms,peer_blocks,rep,peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz"
+EXP23_HEADER="exp,far_die,peer_die,bg_local,bg_sms,peer_blocks,rep,peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz,peer_ovl"
 ndev=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d ' ')
 if [[ "$ndev" -lt 2 ]]; then
   echo "--- exp2/exp3 skipped: needs 2 GPUs, found $ndev ---"
@@ -112,7 +112,7 @@ else
       name="exp${e}_bglocal${local}"
       echo "--- $name ---"
       NVHBI_BG_LOCAL="$local" ./nvhbi_exp23_peer "$e" > "$OUTDIR/$name.log" 2>&1
-      { echo "$EXP23_HEADER"; nvhbi_cfg_rows "$OUTDIR/$name.log" 12; } > "$OUTDIR/$name.csv"
+      { echo "$EXP23_HEADER"; nvhbi_cfg_rows "$OUTDIR/$name.log" 13; } > "$OUTDIR/$name.csv"
       echo "  -> $OUTDIR/$name.csv ($(( $(wc -l < "$OUTDIR/$name.csv") - 1 )) rows)"
     done
   done
@@ -123,9 +123,42 @@ else
 fi
 nvhbi_clock_snapshot "after-exp23" "$GPU_ID" | tee -a "$MANIFEST"
 
+# ------------------------------------------------------- dualdir (the ceiling)
+# THIS IS THE ROW EXP2 HAS TO BE READ AGAINST, and it has to come from the same
+# allocation. exp2's background tops out around 3.4-3.5 TB/s cross-die, but that
+# number alone cannot say whether the limit is the NV-HBI link or the 70 writing
+# SMs on the source die. dualdir adds a SECOND payload source on the same
+# direction (die-B SMs reading die-A memory, so the payload also travels A->B)
+# using SMs the writers do not have. If the total still stops at the write-alone
+# figure, the direction really is link-limited; if it climbs, 3.4 TB/s was a
+# source-side limit and NV-HBI was never saturated.
+#
+# Read it next to exp2's crossing_GBps: exp2 reports background + peer summing
+# to ~4.1 TB/s on that same direction. Those two cannot both be right unless the
+# peer traffic is not actually crossing.
+echo "--- dualdir: one direction, two payload sources (the NV-HBI ceiling) ---"
+DUAL_HEADER="w_sms,r_sms,r_local,rep,write_GBps,read_GBps,total_GBps"
+: > "$OUTDIR/dualdir.log"
+for rloc in 0 1; do
+  NVHBI_R_LOCAL="$rloc" ./nvhbi_dualdir 0 >> "$OUTDIR/dualdir.log" 2>&1 || true
+done
+{ echo "$DUAL_HEADER"; nvhbi_cfg_rows "$OUTDIR/dualdir.log" 7; } > "$OUTDIR/dualdir.csv"
+echo "  -> $OUTDIR/dualdir.csv ($(( $(wc -l < "$OUTDIR/dualdir.csv") - 1 )) rows)"
+
+# --------------------------------------------------- peerl2 (L2 or HBM?)
+if [[ "$ndev" -ge 2 ]]; then
+  echo "--- peerl2: is GPU1 served from GPU0's L2 or from GPU0's HBM? ---"
+  PL2_HEADER="kind,die,is_far,state,cv,corun,rep,peer_cyc,local_cyc,peer_GBps,co_GBps,chunks"
+  ./nvhbi_peerl2 > "$OUTDIR/peerl2.log" 2>&1 || true
+  { echo "$PL2_HEADER"; nvhbi_cfg_rows "$OUTDIR/peerl2.log" 12; } > "$OUTDIR/peerl2.csv"
+  echo "  -> $OUTDIR/peerl2.csv ($(( $(wc -l < "$OUTDIR/peerl2.csv") - 1 )) rows)"
+fi
+nvhbi_clock_snapshot "after-dual-peerl2" "$GPU_ID" | tee -a "$MANIFEST"
+
 # ---------------------------------------------------------------- exp4
 if [[ "$WITH_NCCL" == "1" && "$ndev" -ge 2 ]]; then
   echo "--- exp4: NCCL all-to-all under contention ---"
+  nvhbi_find_nccl || true
   if nvhbi_build nccl; then
     for local in 0 1; do
       name="exp4_bglocal${local}"

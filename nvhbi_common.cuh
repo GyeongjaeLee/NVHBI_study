@@ -380,12 +380,26 @@ __global__ void nvhbi_stress_write(unsigned int* __restrict__ data,
 // Injection rate is controlled by the grid size (how many warps inject), and
 // every point runs for a fixed wall time via deadline_cycles, so a sweep over
 // grid sizes gives evenly-timed samples along the NVLink-load axis.
+//
+// idle_cycles: a spin after each store group, so the duty cycle is roughly
+// work/(work+idle) and injection is continuously tunable. Added because the
+// first sweep used peer_blocks 16..1024 and every point read 634-645 GB/s -- the
+// smallest grid already saturated NVLink, so the whole x axis sat past
+// saturation and four points were plotted where there was really only one.
+// Grid size alone quantises the load to whole warps and cannot go below that.
+__device__ __forceinline__ void nvhbi_spin(unsigned long long cycles) {
+    if (!cycles) return;
+    const unsigned long long s = clock64();
+    while ((unsigned long long)(clock64() - s) < cycles) { }
+}
+
 __global__ void nvhbi_peer_write(unsigned int* __restrict__ peer_data,
                                  const unsigned int* __restrict__ idx_list,
                                  unsigned int first,
                                  unsigned int count,
                                  unsigned int iteration,
                                  unsigned long long deadline_cycles,
+                                 unsigned int idle_cycles,
                                  unsigned long long* __restrict__ progress,
                                  unsigned int* __restrict__ sink) {
     const unsigned int lane   = threadIdx.x % 32u;
@@ -410,13 +424,122 @@ __global__ void nvhbi_peer_write(unsigned int* __restrict__ peer_data,
             nvhbi_st(a[0], val); nvhbi_st(a[1], val);
             nvhbi_st(a[2], val); nvhbi_st(a[3], val);
             ++val;
-            done += 4ull;
+            done += 4ull;                    // 4 remote 32B sectors
+            nvhbi_spin(idle_cycles);
         }
         if (deadline_cycles &&
             (unsigned long long)(clock64() - t0) > deadline_cycles) stop = true;
     }
     if (progress && lane == 0u) atomicAdd(progress, done * lanes);
     nvhbi_st(&sink[blockIdx.x & 127u], val);
+}
+
+/* ------------------------------------------------ peer (NVLink) read kernel
+
+   The mirror of nvhbi_peer_write: GPU1 pulls from GPU0. Needed for a question
+   the write-only experiments cannot answer -- when GPU1 touches a region GPU0
+   has just warmed, is it served out of GPU0's L2 or does it go to GPU0's HBM?
+
+   One 4B load per 128B line, 32 lanes covering the 32 lines of a 4KiB chunk, so
+   one instruction per chunk. A 4B remote load drags a whole 128B line, so 4
+   sectors are billed per lane -- the same accounting nvhbi_dualdir uses.
+
+   THE REPLICA IS THE TRAP. A remote read leaves a copy on the REQUESTER's side,
+   so the second visit to a line is a local L2 hit and crosses nothing. That is
+   why nvhbi_dualdir streams over a footprint many times L2 instead of re-reading
+   a resident one, and any caller of this kernel has to do the same or accept
+   that it is measuring a local cache.
+
+   `cv` selects the load flavour and the difference between the two IS a
+   measurement:
+     0 -> ld.global.cg   a replica on the reading side may serve the access
+     1 -> ld.global.cv   volatile: re-fetch, so every access leaves this GPU
+   Over NVLink the replica question is open in a way it is not for a die hop:
+   if cg is much faster than cv on a re-read footprint, GPU1 is caching GPU0's
+   lines locally and the "bandwidth" is not crossing NVLink at all.            */
+__global__ void nvhbi_peer_read(const unsigned int* __restrict__ peer_data,
+                                const unsigned int* __restrict__ idx_list,
+                                unsigned int first,
+                                unsigned int count,
+                                unsigned long long deadline_cycles,
+                                unsigned int idle_cycles,
+                                unsigned int cv,
+                                unsigned long long* __restrict__ progress,
+                                unsigned int* __restrict__ sink) {
+    const unsigned int lane   = threadIdx.x % 32u;
+    const unsigned int gwarp  = (blockIdx.x * blockDim.x + threadIdx.x) / 32u;
+    const unsigned int nwarps = (gridDim.x * blockDim.x) / 32u;
+    // deadline_cycles is the ONLY exit; a zero deadline would spin forever.
+    if (count == 0u || deadline_cycles == 0ull) return;
+
+    const unsigned long long lanes =
+        (unsigned long long)min(32u, blockDim.x - (threadIdx.x / 32u) * 32u);
+
+    unsigned int acc = 0u;
+    unsigned long long done = 0ull;
+    const unsigned long long t0 = clock64();
+    bool stop = false;
+
+#pragma unroll 1
+    for (unsigned int it = 0; !stop; ++it) {
+#pragma unroll 1
+        for (unsigned int c = gwarp; c < count; c += nwarps) {
+            const unsigned int* p = &peer_data[idx_list[first + c] + 32u * lane];
+            unsigned int v;
+            if (cv) asm volatile("ld.global.cv.u32 %0, [%1];" : "=r"(v) : "l"(p));
+            else    asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(v) : "l"(p));
+            acc += v;
+            done += 4ull;                    // one 4B load pulls a 128B line
+            nvhbi_spin(idle_cycles);
+        }
+        if (deadline_cycles &&
+            (unsigned long long)(clock64() - t0) > deadline_cycles) stop = true;
+    }
+    if (progress && lane == 0u) atomicAdd(progress, done * lanes);
+    nvhbi_st(&sink[blockIdx.x & 127u], acc);
+}
+
+/* --------------------------------------------- peer LOAD latency, cold or warm
+
+   nvhbi_peer_latency times an ATOMIC after a warm-up, on purpose: an atomic
+   always travels to the home L2 slice, which is what makes it a clean topology
+   probe. That is the wrong instrument for "L2 or HBM?", because the warm-up is
+   exactly the variable under test.
+
+   This one times a dependency chain of ordinary LOADS with no warm-up, so the
+   caller controls the cache state: warm the region from GPU0's own SMs and the
+   chain should report an L2-hit round trip; flush GPU0's L2 first and it should
+   report an HBM round trip. The difference between the two is the answer.
+
+   `stride_chunks` walks the list with a stride so a single pass over `nchunks`
+   never revisits a line -- once GPU1 has read a line, GPU0's L2 holds it and
+   the second visit is warm no matter what the caller set up.                   */
+__global__ void nvhbi_peer_load_latency(const unsigned int* __restrict__ peer_data,
+                                        const unsigned int* __restrict__ idx_list,
+                                        unsigned int first,
+                                        unsigned int nchunks,
+                                        unsigned int probe_smid,
+                                        unsigned int cv,
+                                        unsigned int* __restrict__ out_cyc,
+                                        unsigned int* __restrict__ sink) {
+    if (nvhbi_smid() != probe_smid || threadIdx.x != 0 || nchunks == 0u) return;
+
+    // A pointer chase would need the region pre-linked; instead make the NEXT
+    // address depend on the value just loaded, which the memset pattern makes
+    // nonzero but bounded. Accesses cannot overlap either way.
+    unsigned int v = 0u;
+    const unsigned long long t0 = nvhbi_clock();
+#pragma unroll 1
+    for (unsigned int c = 0; c < nchunks; ++c) {
+        const unsigned int* p = &peer_data[idx_list[first + c] + (v & 31u)];
+        unsigned int x;
+        if (cv) asm volatile("ld.global.cv.u32 %0, [%1];" : "=r"(x) : "l"(p));
+        else    asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(x) : "l"(p));
+        v = x;
+    }
+    const unsigned long long t1 = nvhbi_clock();
+    *out_cyc = (unsigned int)((t1 - t0) / nchunks);
+    nvhbi_st(&sink[0], v);
 }
 
 /* ------------------------------------------- peer attach-point pre-check

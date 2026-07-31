@@ -27,6 +27,13 @@
 #   NVHBI_PEER_BLOCKS_LIST=0,64,256,1024,4096 ./run_exp23_peer.sh
 #   NVHBI_MEMCPY=1 ./run_exp23_peer.sh      # also time cudaMemcpyPeer
 #
+# Two knobs worth running before believing a flat result:
+#   NVHBI_PEER_IDLE=<cycles>   Throttles injection continuously. The default
+#                              sweep saturates NVLink at its smallest grid, so
+#                              without this there are no sub-saturation points.
+#   NVHBI_PEER_OVERLAP=1       Peer and background write the SAME chunks instead
+#                              of disjoint regions.
+#
 # Env: CSV_OUT + every NVHBI_* knob in nvhbi_exp23_peer.cu
 
 set -euo pipefail
@@ -37,8 +44,8 @@ PROG="nvhbi_exp23_peer"
 CSV_OUT="${CSV_OUT:-exp23_peer.csv}"
 LOG_OUT="${LOG_OUT:-exp23_peer.log}"
 WHICH="${1:-both}"
-CFG_FIELDS=12
-CFG_HEADER="exp,far_die,peer_die,bg_local,bg_sms,peer_blocks,rep,peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz"
+CFG_FIELDS=13
+CFG_HEADER="exp,far_die,peer_die,bg_local,bg_sms,peer_blocks,rep,peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz,peer_ovl"
 
 ndev=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d ' ')
 if [[ "$ndev" -lt 2 ]]; then
