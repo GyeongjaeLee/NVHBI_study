@@ -194,7 +194,11 @@ int main(int argc, char** argv) {
     const unsigned int window_ms = env_u("NVHBI_WINDOW_MS", 200u);
     const unsigned int repeat    = env_u("NVHBI_REPEAT", 3u);
     const unsigned int r_local   = env_u("NVHBI_R_LOCAL", 0u);
-    const double       buf_mult  = (double)env_u("NVHBI_BUF_MULT", 8u);
+    // Big by default. At buf_mult=8 the sweep was 506 MB, only 8x one die's L2,
+// and that was not enough: the LOCAL control read 12.2 TB/s, about 3x what a
+// single die's HBM can supply, so most of it was still L2 hits. 32 gives ~2 GB
+// per die, ~32x the per-die L2.
+    const double       buf_mult  = (double)env_u("NVHBI_BUF_MULT", 32u);
 
     unsigned int w_list[16], r_list[16];
     const int w_n = parse_list("NVHBI_W_SMS", "0,70", w_list, 16);
@@ -228,6 +232,11 @@ int main(int argc, char** argv) {
            r_chunks * 4096.0 / (t.l2_bytes / 2.0),
            r_local ? "  [LOCAL CONTROL: crosses nothing]" : "");
     printf("  loads: ld.global.%s, contiguous 16B/lane\n", NVHBI_LDOP);
+    // A read served from one die's HBM cannot beat that die's HBM bandwidth.
+    // Anything far above it is L2 reuse, not fabric traffic, so print the bar.
+    printf("  NOTE: reads come from ONE die's HBM. Anything far above that die's\n"
+           "        HBM bandwidth (~half the GPU's) is L2 reuse, not crossing --\n"
+           "        raise NVHBI_BUF_MULT until read_GBps stops falling.\n");
     printf("# CFG,w_sms,r_sms,r_local,rep,write_GBps,read_GBps,total_GBps\n");
 
     cudaStream_t s;
