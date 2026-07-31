@@ -54,16 +54,6 @@
 // poll itself can be measured: -DNVHBI_POLL_MASK=65535u polls 64x less often.
 // exp1 (fixed-iteration branch, no poll at all) reaches 83.6 GB/s per SM where
 // this branch reaches 62.8, and the poll is the only difference in the loop.
-// Store shape, switchable at build time so no kernel signature changes:
-//   0 = scattered 4B per lane at 32B stride  (the original)
-//   3 = contiguous 16B per lane              (same sectors, 1/4 the transactions)
-// Both cover the same 128 sectors per warp-iteration, so the sector accounting
-// (4 per lane per group) and the footprint are identical; only the transaction
-// count and the real data volume change.
-#ifndef NVHBI_STORE_MODE
-#define NVHBI_STORE_MODE 0
-#endif
-
 #ifndef NVHBI_POLL_MASK
 #define NVHBI_POLL_MASK 1023u
 #endif
@@ -83,11 +73,6 @@ __device__ __forceinline__ unsigned int nvhbi_smid() {
 // merge across loop iterations.
 __device__ __forceinline__ void nvhbi_st(unsigned int* addr, unsigned int val) {
     asm volatile("st.global.cg.u32 [%0], %1;" :: "l"(addr), "r"(val));
-}
-
-// 16B store. Address must be 16B aligned.
-__device__ __forceinline__ void nvhbi_st4(unsigned int* addr, unsigned int v) {
-    asm volatile("st.global.cg.v4.u32 [%0], {%1,%1,%1,%1};" :: "l"(addr), "r"(v));
 }
 
 __device__ __forceinline__ unsigned int nvhbi_ld(const unsigned int* addr) {
@@ -135,31 +120,21 @@ __device__ __forceinline__ void nvhbi_lane_addrs(unsigned int* data,
 // Bytes per sector do not move the sector rate; instruction count does. This
 // shape is therefore optimal for loading the fabric: 32 lanes each hitting a
 // distinct sector is 32 sectors per instruction, the hardware maximum.
+// One store group = 4 remote 32B sectors per lane: each lane writes 4B into
+// each of 4 sectors, and a lane quad covers the four sectors of one 128B line.
+// 32 sectors per instruction is the most one instruction can touch, and that is
+// what makes this the heaviest fabric load an SM can generate. A contiguous
+// 16B-per-lane variant was measured against it and was worse (2700 vs 3481
+// GB/s): the fabric is paid per sector, not per transaction, so trading sectors
+// per instruction for data density loses.
 __device__ __forceinline__ void nvhbi_store_group(unsigned int* data,
                                                   unsigned int cidx,
                                                   unsigned int lane,
                                                   unsigned int val) {
-#if NVHBI_STORE_MODE == 3
-    // Fully coalesced: instruction j writes 32 lanes x 16B contiguous = 512B,
-    // which the coalescer turns into four 128B transactions. Lanes 2m and 2m+1
-    // together fill sector m, so eight instructions still cover exactly the
-    // 128 sectors of the 4KiB chunk -- same sector count as mode 0, but 32
-    // transactions instead of 128, and 4KiB of real data instead of 512B.
-    // Tests whether the fabric is charged per transaction rather than per
-    // sector; mode 2 never did, because it kept the 32B stride and so kept
-    // 32 transactions per instruction.
-#pragma unroll
-    for (unsigned int j = 0; j < 8u; ++j)
-        nvhbi_st4(&data[cidx + 128u * j + 4u * lane], val);
-#else
-    // Scattered: each lane owns a distinct 32B sector, 32 sectors per
-    // instruction -- the most sectors one instruction can touch, but also 32
-    // separate transactions.
     unsigned int* a[4];
     nvhbi_lane_addrs(data, cidx, lane, a);
     nvhbi_st(a[0], val); nvhbi_st(a[1], val);
     nvhbi_st(a[2], val); nvhbi_st(a[3], val);
-#endif
 }
 
 /* -------------------------------------------------------- topology probing */

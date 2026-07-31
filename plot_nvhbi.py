@@ -34,6 +34,8 @@ import matplotlib.pyplot as plt
 EXP1_HEADER_HINT = "writer_partition,own_die,num_active_sm"
 EXP23_HEADER = ("exp,far_die,peer_die,bg_local,bg_sms,peer_blocks,rep,"
                 "peer_ms,peer_GBps,bg_GBps,crossing_GBps,bg_GHz")
+EXP4_HEADER = "exp,bg_local,bg_sms,msg_bytes,rep,nccl_ms,algbw_GBps,busbw_GBps,bg_GBps"
+DUAL_HEADER = "w_sms,r_sms,r_local,rep,write_GBps,read_GBps,total_GBps"
 
 
 def load_rows(session_dir, stem, header_if_log):
@@ -117,23 +119,25 @@ def plot_exp1(rows, outdir):
                     continue
                 xs = sorted(series)
                 ys = [median(series[x]) for x in xs]
-                # Spell out that the dashed/solid split is the WRITING die, not
-                # the target: reading it as own-vs-cross inverts the whole figure.
+                # Spell out that the dash split is the WRITING die, not the
+                # target: reading it as own-vs-cross inverts the whole figure.
                 lbl = f"block={bs}" + (f", writers on die{p}" if len(partitions) > 1 else "")
                 ax.plot(xs, ys, marker="o", markersize=4, linestyle=styles[p],
                         color=cmap(ci % 10), label=lbl)
                 if per_sm_ref is None and xs and xs[0] > 0:
                     per_sm_ref = ys[0] / xs[0]
 
-        # Perfect scaling from the 1-SM rate. On log-log that is a straight line,
-        # so the point where the curves peel off IS the saturation knee. On a
-        # linear y axis it is invisible -- everything just looks like growth.
+        # Perfect scaling from the 1-SM rate. On log-log this is a straight line,
+        # so where the curves peel off IS the saturation knee. On a linear y axis
+        # it is invisible -- everything just looks like growth.
         if per_sm_ref:
             allx = sorted({x for g in group.values() for x in g})
             ax.plot(allx, [per_sm_ref * x for x in allx], color="0.45",
                     linestyle=":", linewidth=1.4, zorder=0,
                     label=f"ideal linear ({per_sm_ref:.0f} GB/s per SM)")
 
+        ax.set_xscale("log", base=2)
+        ax.set_yscale("log", base=10)
         ax.set_xlabel("number of writing SMs")
         ax.set_ylabel("write bandwidth (GB/s)")
         ax.set_title(title)
@@ -149,9 +153,10 @@ def plot_exp1(rows, outdir):
 def plot_exp23(rows, stem, outdir):
     """Two panels: background BW and NVLink BW vs NVLink load.
 
-    x is peer_blocks, the knob that sets how hard GPU1 injects over NVLink.
-    peer_blocks=0 means no NVLink traffic, so it is the clean baseline on the
-    background panel; bg_sms=0 is the baseline on the NVLink panel.
+    x is peer_blocks, the knob that sets how hard GPU1 injects. peer_blocks=0 is
+    the clean baseline on the background panel; bg_sms=0 is the baseline on the
+    NVLink panel. Flat lines here are the result, not a failure: neither P2P
+    kernel stores nor copy-engine DMA moved the background by more than 0.1%.
     """
     if not rows:
         print(f"{stem}: no rows, skipping")
@@ -159,7 +164,8 @@ def plot_exp23(rows, stem, outdir):
 
     exp = i(rows[0], "exp")
     bg_local = i(rows[0], "bg_local")
-    bg_mode = "own-die background (control)" if bg_local else "cross-die background (bisection probe)"
+    bg_mode = ("own-die background (control)" if bg_local
+               else "cross-die background (bisection probe)")
     peer_desc = "peer -> FAR die" if exp == 2 else "peer -> NEAR die"
 
     bg = defaultdict(lambda: defaultdict(list))    # [bg_sms][peer_blocks]
@@ -173,15 +179,13 @@ def plot_exp23(rows, stem, outdir):
 
     fig, (axl, axr) = plt.subplots(1, 2, figsize=(12.4, 5.0))
     cmap = plt.get_cmap("viridis")
-    sms_bg = sorted(bg)
-    sms_pr = sorted(pr)
+    sms_bg, sms_pr = sorted(bg), sorted(pr)
 
     def colour(s, allsms):
         if len(allsms) < 2:
             return cmap(0.5)
         return cmap(allsms.index(s) / (len(allsms) - 1))
 
-    # left: does NVLink traffic cost the background anything?
     for s in sms_bg:
         xs = sorted(bg[s])
         ys = [median(bg[s][x]) for x in xs]
@@ -189,23 +193,20 @@ def plot_exp23(rows, stem, outdir):
                  color=colour(s, sms_bg), label=f"bg {s} SMs")
     axl.set_ylabel("background write bandwidth (GB/s)")
     axl.set_title("Background BW vs NVLink load")
-    axl.set_ylim(bottom=0)
 
-    # right: does the background cost NVLink anything?
     for s in sms_pr:
         xs = sorted(pr[s])
         ys = [median(pr[s][x]) for x in xs]
-        axr.plot(xs, ys, marker="s", markersize=4,
-                 color=colour(s, sms_pr),
+        axr.plot(xs, ys, marker="s", markersize=4, color=colour(s, sms_pr),
                  label=("no bg" if s == 0 else f"bg {s} SMs"))
     axr.set_ylabel("NVLink (peer) write bandwidth (GB/s)")
     axr.set_title("NVLink BW vs NVLink load")
-    axr.set_ylim(bottom=0)
 
     for ax in (axl, axr):
         ax.set_xscale("log", base=2)
         ax.set_xlabel("NVLink load  (peer grid blocks; 1 = none)")
         ax.grid(True, alpha=0.3, which="both")
+        ax.set_ylim(bottom=0)
         ax.legend(fontsize=8)
 
     fig.suptitle(f"exp{exp}: {peer_desc},  {bg_mode}")
@@ -243,6 +244,113 @@ def summarise_exp23(rows, stem):
               f"({(p1/p0-1)*100:+.2f}%)")
 
 
+def plot_exp4(rows, outdir):
+    """x = message size, y = NCCL busbw, one line per background SM count.
+
+    Solid = background crosses the dies, dashed = same background confined to
+    its own die. The gap between them is the bisection effect; the drop both
+    share against bg_sms=0 is NCCL simply losing SMs.
+    """
+    if not rows:
+        print("exp4: no rows, skipping")
+        return
+    g = defaultdict(lambda: defaultdict(list))          # [(bg_local,bg_sms)][bytes]
+    bgw = defaultdict(lambda: defaultdict(list))
+    for r in rows:
+        k = (i(r, "bg_local"), i(r, "bg_sms"))
+        g[k][i(r, "msg_bytes")].append(f(r, "busbw_GBps"))
+        if i(r, "bg_sms") > 0:
+            bgw[k][i(r, "msg_bytes")].append(f(r, "bg_GBps"))
+
+    fig, (axl, axr) = plt.subplots(1, 2, figsize=(12.4, 5.0))
+    sms = sorted({k[1] for k in g})
+    cmap = plt.get_cmap("viridis")
+    for (loc, s), series in sorted(g.items()):
+        xs = sorted(series)
+        ys = [median(series[x]) for x in xs]
+        col = cmap(sms.index(s) / max(len(sms) - 1, 1))
+        axl.plot(xs, ys, marker="o", markersize=4, color=col,
+                 linestyle="--" if loc else "-",
+                 label=f"bg {s} SMs" + (" (own-die)" if loc else ""))
+    axl.set_ylabel("NCCL busbw (GB/s)")
+    axl.set_title("Collective throughput vs message size")
+    axl.set_xscale("log", base=2)
+
+    for (loc, s), series in sorted(bgw.items()):
+        xs = sorted(series)
+        ys = [median(series[x]) for x in xs]
+        col = cmap(sms.index(s) / max(len(sms) - 1, 1))
+        axr.plot(xs, ys, marker="s", markersize=4, color=col,
+                 linestyle="--" if loc else "-",
+                 label=f"bg {s} SMs" + (" (own-die)" if loc else ""))
+    axr.set_ylabel("background write bandwidth (GB/s)")
+    axr.set_title("What the background gave up")
+    axr.set_xscale("log", base=2)
+
+    for ax in (axl, axr):
+        ax.set_xlabel("per-pair message size (bytes)")
+        ax.grid(True, alpha=0.3, which="both")
+        ax.set_ylim(bottom=0)
+        ax.legend(fontsize=8)
+    fig.suptitle("exp4: NCCL all-to-all under NV-HBI contention "
+                 "(buffers are die-agnostic; NCCL also competes for SMs)")
+    fig.tight_layout()
+    path = os.path.join(outdir, "exp4_nccl.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {path}")
+
+
+def plot_dual(rows, outdir):
+    """x = reader SMs, y = write / read / their sum, at fixed writer count.
+
+    Both payloads travel the same direction, so the sum is what that direction
+    carried. The dashed line is writes with no readers at all: if the sum never
+    reaches it, a second source does not add bandwidth.
+    """
+    if not rows:
+        print("dualdir: no rows, skipping")
+        return
+    loc = [r for r in rows if i(r, "r_local") == 0]
+    if not loc:
+        return
+    w_max = max(i(r, "w_sms") for r in loc)
+    sel = [r for r in loc if i(r, "w_sms") == w_max]
+    if not sel:
+        return
+
+    series = defaultdict(lambda: defaultdict(list))
+    for r in sel:
+        rs = i(r, "r_sms")
+        series["write"][rs].append(f(r, "write_GBps"))
+        series["read"][rs].append(f(r, "read_GBps"))
+        series["total"][rs].append(f(r, "total_GBps"))
+
+    fig, ax = plt.subplots(figsize=(7.4, 5.0))
+    for name, col in (("write", "tab:blue"), ("read", "tab:orange"),
+                      ("total", "tab:green")):
+        xs = sorted(series[name])
+        ys = [median(series[name][x]) for x in xs]
+        ax.plot([max(x, 1) for x in xs], ys, marker="o", markersize=5,
+                color=col, label=name)
+    solo = series["write"].get(0)
+    if solo:
+        ax.axhline(median(solo), color="tab:blue", linestyle="--", linewidth=1.2,
+                   label=f"writes alone ({median(solo):.0f} GB/s)")
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("reader SMs on the far die  (1 = none)")
+    ax.set_ylabel("bandwidth on the A->B direction (GB/s)")
+    ax.set_title(f"Two payload sources on one direction ({w_max} writer SMs)")
+    ax.grid(True, alpha=0.3, which="both")
+    ax.set_ylim(bottom=0)
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    path = os.path.join(outdir, "dualdir.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -267,6 +375,19 @@ def main():
         print(f"{stem}: {len(rows)} rows")
         plot_exp23(rows, stem, outdir)
         summarise_exp23(rows, stem)
+
+    for stem in ("exp4_bglocal0", "exp4_bglocal1", "exp4_nccl"):
+        rows = load_rows(args.session_dir, stem, EXP4_HEADER)
+        if rows:
+            print(f"{stem}: {len(rows)} rows")
+    exp4 = []
+    for stem in ("exp4_bglocal0", "exp4_bglocal1", "exp4_nccl"):
+        exp4 += load_rows(args.session_dir, stem, EXP4_HEADER)
+    plot_exp4(exp4, outdir)
+
+    dual = load_rows(args.session_dir, "dualdir", DUAL_HEADER)
+    print(f"dualdir: {len(dual)} rows")
+    plot_dual(dual, outdir)
 
 
 if __name__ == "__main__":

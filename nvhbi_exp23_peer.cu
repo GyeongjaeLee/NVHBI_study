@@ -45,7 +45,8 @@
 //      NVHBI_REPEAT             reps per point,               default 3
 //      NVHBI_PEER_CHUNKS        peer footprint in 4KiB chunks,default 4096 (16MB)
 //      NVHBI_BG_BLOCK / NVHBI_BG_BLOCKS_PER_SM / NVHBI_BG_LINES
-//      NVHBI_MEMCPY             1 = also time cudaMemcpyPeer, default 0
+//      NVHBI_PEER_MODE          0 = GPU1 kernel P2P stores (default)
+//                               1 = cudaMemcpyPeerAsync (copy engines, die-agnostic)
 //      NVHBI_BUF_MULT           default 8
 
 #include "nvhbi_common.cuh"
@@ -97,7 +98,6 @@ int main(int argc, char** argv) {
     // dies interleave at 4KiB -- so it lands ~50/50 and the exp2/exp3 (far/near)
     // distinction does not apply to it.
     const unsigned int peer_mode = env_u("NVHBI_PEER_MODE", 0u);
-    const unsigned int do_memcpy = env_u("NVHBI_MEMCPY", 0u);
     const double       buf_mult  = (double)env_u("NVHBI_BUF_MULT", 8u);
 
     unsigned int bg_list[32], pk_list[32];
@@ -596,28 +596,6 @@ int main(int argc, char** argv) {
             fflush(stdout);
         }
     }}
-
-    if (do_memcpy) {
-        const size_t bytes = (size_t)peer_chunks * NVHBI_CHUNK_BYTES;
-        unsigned int *src = nullptr, *dst = nullptr;
-        CHECK_CUDA(cudaSetDevice(1));
-        CHECK_CUDA(cudaMalloc(&src, bytes)); CHECK_CUDA(cudaMemset(src, 0x3c, bytes));
-        CHECK_CUDA(cudaSetDevice(0));
-        CHECK_CUDA(cudaMalloc(&dst, bytes));
-        CHECK_CUDA(cudaSetDevice(1));
-        cudaEvent_t m0, m1; CHECK_CUDA(cudaEventCreate(&m0)); CHECK_CUDA(cudaEventCreate(&m1));
-        CHECK_CUDA(cudaMemcpyPeerAsync(dst, 0, src, 1, bytes, s_peer));
-        CHECK_CUDA(cudaStreamSynchronize(s_peer));
-        CHECK_CUDA(cudaEventRecord(m0, s_peer));
-        for (int i = 0; i < 10; ++i) CHECK_CUDA(cudaMemcpyPeerAsync(dst, 0, src, 1, bytes, s_peer));
-        CHECK_CUDA(cudaEventRecord(m1, s_peer));
-        CHECK_CUDA(cudaStreamSynchronize(s_peer));
-        float mms = 0.f; CHECK_CUDA(cudaEventElapsedTime(&mms, m0, m1));
-        printf("MEMCPY_PEER,%zu,%.4f,%.2f  # bytes,ms(x10),GB/s -- die-agnostic (~50/50)\n",
-               bytes, mms, (double)bytes * 10.0 / (mms * 1e-3) / 1e9);
-        CHECK_CUDA(cudaEventDestroy(m0)); CHECK_CUDA(cudaEventDestroy(m1));
-        CHECK_CUDA(cudaFree(src)); CHECK_CUDA(cudaSetDevice(0)); CHECK_CUDA(cudaFree(dst));
-    }
 
     CHECK_CUDA(cudaSetDevice(1));
     CHECK_CUDA(cudaEventDestroy(pe0)); CHECK_CUDA(cudaEventDestroy(pe1));
