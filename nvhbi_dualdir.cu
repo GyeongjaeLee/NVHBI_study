@@ -58,6 +58,20 @@
 #ifndef NVHBI_READ_OP
 #define NVHBI_READ_OP 0
 #endif
+// Read shape. Both cover the same 4KiB chunk and count the same 128 sectors,
+// but they bet differently on the cross-die transfer granularity:
+//   0 contiguous 16B/lane, 8 instructions. Reads all 4096 B explicitly, so the
+//     count is right whatever the granularity -- but if a line really crosses
+//     as 128 B, then the 8 lanes sharing a line make 7/8 of the loads redundant
+//     for fabric purposes while still costing SM issue slots.
+//   1 128B stride, 1 instruction: one 4B load per line, 32 lanes -> 32 lines.
+//     Correct only if a 4B load really drags the whole 128 B across.
+// Comparing them at a large NVHBI_BUF_MULT settles it:
+//   equal read_GBps      -> 128 B granularity, and stride is 8x cheaper to issue
+//   stride ~4x higher    -> 32 B sectors, stride overcounts by 4
+#ifndef NVHBI_READ_PATTERN
+#define NVHBI_READ_PATTERN 0
+#endif
 #if   NVHBI_READ_OP == 2
 #define NVHBI_LDOP "cs"
 #elif NVHBI_READ_OP == 1
@@ -71,6 +85,29 @@ __device__ __forceinline__ void nvhbi_ld4(const unsigned int* addr,
                                           unsigned int& c, unsigned int& d) {
     asm volatile("ld.global." NVHBI_LDOP ".v4.u32 {%0,%1,%2,%3}, [%4];"
                  : "=r"(a), "=r"(b), "=r"(c), "=r"(d) : "l"(addr));
+}
+__device__ __forceinline__ unsigned int nvhbi_ld1(const unsigned int* addr) {
+    unsigned int v;
+    asm volatile("ld.global." NVHBI_LDOP ".u32 %0, [%1];" : "=r"(v) : "l"(addr));
+    return v;
+}
+
+// Pull one 4KiB chunk. Both shapes count 4 sectors per lane.
+__device__ __forceinline__ unsigned int nvhbi_read_chunk(const unsigned int* data,
+                                                         unsigned int cidx,
+                                                         unsigned int lane) {
+    unsigned int acc = 0u;
+#if NVHBI_READ_PATTERN == 1
+    acc = nvhbi_ld1(&data[cidx + 32u * lane]);      // byte 128*lane: one line per lane
+#else
+#pragma unroll
+    for (unsigned int k = 0; k < 8u; ++k) {
+        unsigned int a, b, c, d;
+        nvhbi_ld4(&data[cidx + 128u * k + 4u * lane], a, b, c, d);
+        acc += a + b + c + d;
+    }
+#endif
+    return acc;
 }
 
 /* ---------------------------------------------------------------------------
@@ -141,13 +178,7 @@ __global__ void nvhbi_dual(unsigned int* __restrict__ data,
         unsigned int c = (slot >= r_count) ? (slot % r_count) : slot;
 #pragma unroll 1
         for (unsigned int it = 0; ; ++it) {
-            const unsigned int cidx = list[c];
-#pragma unroll
-            for (unsigned int k = 0; k < 8u; ++k) {
-                unsigned int a, b, cc, d;
-                nvhbi_ld4(&data[cidx + 128u * k + 4u * lane], a, b, cc, d);
-                acc += a + b + cc + d;
-            }
+            acc += nvhbi_read_chunk(data, list[c], lane);
             done += 4ull;                  // 4096 B per warp = 4 sectors per lane
             c += nwarps;
             if (c >= r_count) c = (c >= 2u * r_count) ? (c % r_count) : (c - r_count);
@@ -231,7 +262,9 @@ int main(int argc, char** argv) {
            rp, r_source_die, r_chunks, r_chunks * 4096.0 / 1048576.0,
            r_chunks * 4096.0 / (t.l2_bytes / 2.0),
            r_local ? "  [LOCAL CONTROL: crosses nothing]" : "");
-    printf("  loads: ld.global.%s, contiguous 16B/lane\n", NVHBI_LDOP);
+    printf("  loads: ld.global.%s, %s\n", NVHBI_LDOP,
+           NVHBI_READ_PATTERN == 1 ? "128B stride (1 instr/chunk)"
+                                   : "contiguous 16B/lane (8 instr/chunk)");
     // A read served from one die's HBM cannot beat that die's HBM bandwidth.
     // Anything far above it is L2 reuse, not fabric traffic, so print the bar.
     printf("  NOTE: reads come from ONE die's HBM. Anything far above that die's\n"
