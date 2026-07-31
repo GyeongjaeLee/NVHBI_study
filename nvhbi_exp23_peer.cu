@@ -87,6 +87,16 @@ int main(int argc, char** argv) {
     const unsigned int bg_local  = env_u("NVHBI_BG_LOCAL", 0u);
     const unsigned int window_ms = env_u("NVHBI_WINDOW_MS", 200u);
     const unsigned int repeat    = env_u("NVHBI_REPEAT", 3u);
+    // How GPU1 pushes into GPU0:
+    //   0 = a kernel on GPU1 dereferencing GPU0 pointers (P2P load/store, SMs)
+    //   1 = cudaMemcpyPeerAsync (copy engines / DMA)
+    // Different hardware paths, so they need not interact with NV-HBI the same
+    // way. The kernel form is what showed zero interference with the
+    // background; whether DMA behaves the same is a separate question.
+    // CAVEAT for mode 1: a contiguous memcpy cannot be aimed at one die -- the
+    // dies interleave at 4KiB -- so it lands ~50/50 and the exp2/exp3 (far/near)
+    // distinction does not apply to it.
+    const unsigned int peer_mode = env_u("NVHBI_PEER_MODE", 0u);
     const unsigned int do_memcpy = env_u("NVHBI_MEMCPY", 0u);
     const double       buf_mult  = (double)env_u("NVHBI_BUF_MULT", 8u);
 
@@ -126,6 +136,11 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMalloc(&d_lat, sizeof(unsigned int)));
     unsigned long long* d_peer_prog = nullptr;
     CHECK_CUDA(cudaMalloc(&d_peer_prog, sizeof(unsigned long long)));
+
+    // DMA buffers for peer_mode 1. Destination is a plain contiguous GPU0
+    // allocation, hence die-agnostic.
+    unsigned int *d_dma_src = nullptr, *d_dma_dst = nullptr;
+    size_t dma_bytes = 0;
 
     cudaStream_t s_peer;
     CHECK_CUDA(cudaStreamCreateWithFlags(&s_peer, cudaStreamNonBlocking));
@@ -359,6 +374,19 @@ int main(int argc, char** argv) {
            peer_chunks * (double)NVHBI_CHUNK_BYTES / (1024.0 * 1024.0));
 
     /* -------- background machinery on GPU0 -------- */
+    if (peer_mode == 1u) {
+        dma_bytes = (size_t)peer_chunks * NVHBI_CHUNK_BYTES;
+        CHECK_CUDA(cudaSetDevice(1));
+        CHECK_CUDA(cudaMalloc(&d_dma_src, dma_bytes));
+        CHECK_CUDA(cudaMemset(d_dma_src, 0x3c, dma_bytes));
+        CHECK_CUDA(cudaSetDevice(0));
+        CHECK_CUDA(cudaMalloc(&d_dma_dst, dma_bytes));
+        printf("  peer path: cudaMemcpyPeerAsync, %.1f MB per copy (DIE-AGNOSTIC)\n",
+               dma_bytes / 1048576.0);
+    } else {
+        printf("  peer path: GPU1 kernel storing into GPU0 (P2P load/store)\n");
+    }
+
     CHECK_CUDA(cudaSetDevice(0));
     cudaStream_t s_bg;
     CHECK_CUDA(cudaStreamCreateWithFlags(&s_bg, cudaStreamNonBlocking));
@@ -496,7 +524,25 @@ int main(int argc, char** argv) {
 
             float peer_ms = 0.f;
             const double wall0 = now_ms();
-            if (pb) {
+            if (pb && peer_mode == 1u) {
+                // Keep the copy engines busy for the whole window, then divide
+                // the bytes actually copied by the time they took.
+                CHECK_CUDA(cudaSetDevice(1));
+                CHECK_CUDA(cudaEventRecord(pe0, s_peer));
+                unsigned int ncopy = 0u;
+                const double until = now_ms() + (double)window_ms;
+                while (now_ms() < until) {
+                    CHECK_CUDA(cudaMemcpyPeerAsync(d_dma_dst, 0, d_dma_src, 1,
+                                                   dma_bytes, s_peer));
+                    ++ncopy;
+                    if ((ncopy & 15u) == 0u) CHECK_CUDA(cudaStreamSynchronize(s_peer));
+                }
+                CHECK_CUDA(cudaEventRecord(pe1, s_peer));
+                CHECK_CUDA(cudaStreamSynchronize(s_peer));
+                CHECK_CUDA(cudaEventElapsedTime(&peer_ms, pe0, pe1));
+                // Report DMA in the same units as the kernel path: 32B sectors.
+                peer_stores = (unsigned long long)ncopy * (dma_bytes / 32u);
+            } else if (pb) {
                 CHECK_CUDA(cudaSetDevice(1));
                 CHECK_CUDA(cudaMemset(d_peer_prog, 0, sizeof(unsigned long long)));
                 const unsigned long long pdl =
@@ -581,6 +627,7 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaFree(d_peer_prog));
     CHECK_CUDA(cudaSetDevice(0));
     CHECK_CUDA(cudaStreamDestroy(s_bg)); CHECK_CUDA(cudaFree(d_bg_prog));
+    if (d_dma_dst) CHECK_CUDA(cudaFree(d_dma_dst));
     CHECK_CUDA(cudaFree(d_bg_cyc));
     nvhbi_stop_flag_destroy(stop);
     nvhbi_free(t);
