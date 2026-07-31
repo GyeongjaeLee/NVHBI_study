@@ -325,7 +325,24 @@ __global__ void nvhbi_stress_write(unsigned int* __restrict__ data,
     unsigned long long done = 0ull;
     const unsigned long long t0 = clock64();
 
+    // lines_mult is a runtime argument, so with the general inner loop the
+    // compiler must keep it and cannot hoist list[...] -- it reloads the index
+    // array and redoes the multiply every iteration, on top of a body that is
+    // only four stores. That cost ~18%: on one B200 this kernel measured 2949
+    // GB/s where the identical store stream with a hoisted index measured 3479.
+    // The L=1 case is the one every experiment actually uses, so give it a path
+    // where the chunk address is loaded once.
+    const unsigned int cidx1 = list[chunk_offset + slot];
+
     if (deadline_cycles == 0ull) {
+        if (lines_mult == 1u) {
+#pragma unroll 1
+            for (unsigned int it = 0; it < iteration; ++it) {
+                nvhbi_store_group(data, cidx1, lane, val);
+                ++val;
+                done += 4ull;
+            }
+        } else {
 #pragma unroll 1
         for (unsigned int it = 0; it < iteration; ++it) {
 #pragma unroll 1
@@ -336,9 +353,15 @@ __global__ void nvhbi_stress_write(unsigned int* __restrict__ data,
             }
             done += 4ull * lines_mult;
         }
+        }
     } else {
 #pragma unroll 1
         for (unsigned int it = 0; ; ++it) {
+            if (lines_mult == 1u) {
+                nvhbi_store_group(data, cidx1, lane, val);
+                ++val;
+                done += 4ull;
+            } else {
 #pragma unroll 1
             for (unsigned int j = 0; j < lines_mult; ++j) {
                 nvhbi_store_group(data, list[chunk_offset + j * plane_stride + slot],
@@ -346,6 +369,7 @@ __global__ void nvhbi_stress_write(unsigned int* __restrict__ data,
                 ++val;
             }
             done += 4ull * lines_mult;
+            }
             // Poll rarely. At every 64 iterations this block was the bottleneck:
             // 4736 warps each reading a MAPPED HOST page over PCIe pinned the
             // whole kernel to ~337 GB/s regardless of SM count (exp1 says 74 SMs
