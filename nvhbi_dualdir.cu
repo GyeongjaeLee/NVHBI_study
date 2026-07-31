@@ -43,34 +43,63 @@
 #include "nvhbi_common.cuh"
 #include <chrono>
 
-#ifndef NVHBI_READ_CG
-#define NVHBI_READ_CG 0
+// Read shape and cache policy, both switchable at build time.
+//   NVHBI_READ_PATTERN 0 = 128B stride, ONE instruction per 4KiB chunk. Each
+//                          lane's 4B load drags a whole 128B line across, so 32
+//                          lanes pull all 32 lines of the chunk. Maximum fabric
+//                          bytes per instruction.
+//                      1 = contiguous 16B per lane, 8 instructions per chunk.
+//                          Wasteful for reads: lanes 0-7 share one 128B line,
+//                          so seven of them just re-read what already arrived.
+//   NVHBI_READ_OP      0 = .cs streaming (evict-first, protects the write set)
+//                      1 = .cv volatile (forced re-fetch)
+//                      2 = .cg ordinary L1-bypassing
+#ifndef NVHBI_READ_PATTERN
+#define NVHBI_READ_PATTERN 0
 #endif
-#ifndef NVHBI_READ_CV
-#define NVHBI_READ_CV 0
+#ifndef NVHBI_READ_OP
+#define NVHBI_READ_OP 0
 #endif
 
-// 16B load.
-//   .cs  streaming / evict-first: the replica a remote read leaves behind is
-//        marked for early eviction, so it does not push the warmed write
-//        targets out of the destination die's L2.
-//   .cv  volatile, forced re-fetch. Tried first and did NOT defeat the replica:
-//        remote and local reads measured identical (3496 vs 3509 GB/s at 16 SMs,
-//        11072 vs 11077 at 72), and 11 TB/s is 3x the fabric ceiling, so those
-//        reads never crossed. Kept switchable for comparison.
+#if   NVHBI_READ_OP == 2
+#define NVHBI_LDOP "cg"
+#elif NVHBI_READ_OP == 1
+#define NVHBI_LDOP "cv"
+#else
+#define NVHBI_LDOP "cs"
+#endif
+
+__device__ __forceinline__ unsigned int nvhbi_ld1(const unsigned int* addr) {
+    unsigned int v;
+    asm volatile("ld.global." NVHBI_LDOP ".u32 %0, [%1];" : "=r"(v) : "l"(addr));
+    return v;
+}
 __device__ __forceinline__ void nvhbi_ld4(const unsigned int* addr,
                                           unsigned int& a, unsigned int& b,
                                           unsigned int& c, unsigned int& d) {
-#if NVHBI_READ_CG
-    asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];"
+    asm volatile("ld.global." NVHBI_LDOP ".v4.u32 {%0,%1,%2,%3}, [%4];"
                  : "=r"(a), "=r"(b), "=r"(c), "=r"(d) : "l"(addr));
-#elif NVHBI_READ_CV
-    asm volatile("ld.global.cv.v4.u32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(a), "=r"(b), "=r"(c), "=r"(d) : "l"(addr));
+}
+
+// Pull one 4KiB chunk across the fabric. Both patterns move the same 4096 B and
+// count the same 4 sectors per lane; they differ only in how many instructions
+// it costs.
+__device__ __forceinline__ unsigned int nvhbi_read_chunk(const unsigned int* data,
+                                                         unsigned int cidx,
+                                                         unsigned int lane) {
+    unsigned int acc = 0u;
+#if NVHBI_READ_PATTERN == 1
+#pragma unroll
+    for (unsigned int k = 0; k < 8u; ++k) {
+        unsigned int a, b, c, d;
+        nvhbi_ld4(&data[cidx + 128u * k + 4u * lane], a, b, c, d);
+        acc += a + b + c + d;
+    }
 #else
-    asm volatile("ld.global.cs.v4.u32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(a), "=r"(b), "=r"(c), "=r"(d) : "l"(addr));
+    // byte offset 128*lane: 32 lanes -> 32 distinct 128B lines -> the whole chunk
+    acc = nvhbi_ld1(&data[cidx + 32u * lane]);
 #endif
+    return acc;
 }
 
 // Readers on `reader_partition` pull from the OTHER die, so the returned data
@@ -122,13 +151,7 @@ __global__ void nvhbi_stream_read(const unsigned int* __restrict__ data,
 
 #pragma unroll 1
     for (unsigned int it = 0; ; ++it) {
-        const unsigned int cidx = idx_list[c];
-#pragma unroll
-        for (unsigned int k = 0; k < 8u; ++k) {
-            unsigned int a, b, cc, d;
-            nvhbi_ld4(&data[cidx + 128u * k + 4u * lane], a, b, cc, d);
-            acc += a + b + cc + d;
-        }
+        acc += nvhbi_read_chunk(data, idx_list[c], lane);
         done += 4ull;                       // 4 sectors per lane, as on the write side
         c += nwarps;
         // One subtraction suffices while nwarps < count (the normal case); the
@@ -214,7 +237,9 @@ int main(int argc, char** argv) {
     printf("           sweep is %.0fx the per-die L2, so a chunk's replica is gone\n"
            "           before the sweep returns to it\n",
            r_chunks * 4096.0 / (t.l2_bytes / 2.0));
-    printf("  loads: %s\n", NVHBI_READ_CG ? "ld.global.cg" : "ld.global.cv (defeats replicas)");
+    printf("  loads: ld.global.%s, pattern=%s\n", NVHBI_LDOP,
+           NVHBI_READ_PATTERN == 1 ? "contiguous 16B/lane (8 instr/chunk)"
+                                   : "128B stride (1 instr/chunk)");
     printf("# CFG,w_sms,r_sms,r_local,rep,write_GBps,read_GBps,total_GBps\n");
 
     cudaStream_t sw, sr;
