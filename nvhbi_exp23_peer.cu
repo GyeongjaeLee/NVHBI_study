@@ -449,6 +449,7 @@ int main(int argc, char** argv) {
             CHECK_CUDA(cudaDeviceSynchronize());
 
             /* start background, settle */
+            double bg_launch_ms = 0.0;
             CHECK_CUDA(cudaMemset(d_bg_prog, 0, sizeof(unsigned long long)));
             CHECK_CUDA(cudaMemset(d_bg_cyc, 0, sizeof(unsigned long long)));
             nvhbi_stop_flag_reset(stop);
@@ -465,6 +466,7 @@ int main(int argc, char** argv) {
                     (unsigned int)t.sm_count, bg_lines, 0u,
                     0u, dl, stop.d, d_bg_prog, d_bg_cyc, t.d_sink);
                 CHECK_CUDA(cudaGetLastError());
+                bg_launch_ms = now_ms();
                 spin_ms(100.0);
             }
 
@@ -519,11 +521,13 @@ int main(int argc, char** argv) {
                 CHECK_CUDA(cudaMemcpy(&bg_cyc, d_bg_cyc, sizeof(bg_cyc),
                                       cudaMemcpyDeviceToHost));
             }
-            // Clock the background actually achieved. It is stopped early by the
-            // flag, so the span is from launch to the stop, not the full deadline:
-            // settle + the measurement window.
-            const double bg_span_ms = 100.0 + wall_ms;
-            const double bg_ghz = (bg_sms && bg_cyc)
+            // Clock the background actually achieved. Measure the span from the
+            // host, launch to drain: warps only notice the stop flag at a poll
+            // boundary, so they overrun it, and a hard-coded span would inflate
+            // this. (With NVHBI_POLL_MASK=65535 the overrun reached ~267 ms
+            // against an assumed 300 ms span and reported 2.1 GHz.)
+            const double bg_span_ms = (bg_launch_ms > 0.0) ? (now_ms() - bg_launch_ms) : 0.0;
+            const double bg_ghz = (bg_sms && bg_cyc && bg_span_ms > 0.0)
                 ? (double)bg_cyc / (bg_span_ms * 1e6) : 0.0;
 
             const double bg_alive_ms = (double)(4u * window_ms + 2000u) - 100.0;
