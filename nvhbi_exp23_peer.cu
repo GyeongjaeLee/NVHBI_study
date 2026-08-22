@@ -310,8 +310,7 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaSetDevice(0));
         nvhbi_flush_l2(t);
         const unsigned int cnt = (die_count(die) < peer_chunks_req) ? die_count(die) : peer_chunks_req;
-        nvhbi_warm_chunks<<<t.sm_count * 8, 128>>>(t.d_data, (die==1u)?t.d_far_idx:t.d_near_idx,
-                                                   0u, cnt, t.d_sm_side, die, t.d_sink);
+        nvhbi_warm(t, (die == 1u) ? t.d_far_idx : t.d_near_idx, 0u, cnt, die);
         CHECK_CUDA(cudaDeviceSynchronize());
         CHECK_CUDA(cudaSetDevice(1));
         CHECK_CUDA(cudaMemset(d_peer_prog, 0, sizeof(unsigned long long)));
@@ -509,9 +508,8 @@ int main(int argc, char** argv) {
         const unsigned int tchunks  = nvhbi_chunks_used(tsms, bg_nbps, bg_block, bg_lines);
         CHECK_CUDA(cudaSetDevice(0));
         nvhbi_flush_l2(t);
-        nvhbi_warm_chunks<<<t.sm_count * 8, 128>>>(
-            t.d_data, (bg_target_die == 1u) ? t.d_far_idx : t.d_near_idx,
-            0u, tchunks, t.d_sm_side, bg_target_die, t.d_sink);
+        nvhbi_warm(t, (bg_target_die == 1u) ? t.d_far_idx : t.d_near_idx,
+                   0u, tchunks, bg_target_die);
         CHECK_CUDA(cudaDeviceSynchronize());
         CHECK_CUDA(cudaMemset(d_bg_prog, 0, sizeof(unsigned long long)));
         nvhbi_stop_flag_reset(stop);
@@ -561,14 +559,11 @@ int main(int argc, char** argv) {
             CHECK_CUDA(cudaSetDevice(0));
             nvhbi_flush_l2(t);
             if (bg_chunks) {
-                nvhbi_warm_chunks<<<t.sm_count * 8, 128>>>(
-                    t.d_data, (bg_target_die==1u)?t.d_far_idx:t.d_near_idx,
-                    0u, bg_chunks, t.d_sm_side, bg_target_die, t.d_sink);
+                nvhbi_warm(t, (bg_target_die == 1u) ? t.d_far_idx : t.d_near_idx,
+                           0u, bg_chunks, bg_target_die);
             }
             if (peer_bs) {
-                nvhbi_warm_chunks<<<t.sm_count * 8, 128>>>(
-                    t.d_data, d_peer_own, peer_first, peer_chunks,
-                    t.d_sm_side, peer_die, t.d_sink);
+                nvhbi_warm(t, d_peer_own, peer_first, peer_chunks, peer_die);
             }
             CHECK_CUDA(cudaGetLastError());
             CHECK_CUDA(cudaDeviceSynchronize());

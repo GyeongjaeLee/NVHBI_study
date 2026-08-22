@@ -207,9 +207,7 @@ int main(int argc, char** argv) {
                 // Both points start from the same cache state. Anything not
                 // proportional to the loop count cancels in the slope anyway.
                 nvhbi_flush_l2(t);
-                nvhbi_warm_chunks<<<t.sm_count * 8, 128>>>(
-                    t.d_data, d_list, 0u, chunks, t.d_sm_side, target_die, t.d_sink);
-                CHECK_CUDA(cudaGetLastError());
+                nvhbi_warm(t, d_list, 0u, chunks, target_die);
                 CHECK_CUDA(cudaDeviceSynchronize());
 
                 CHECK_CUDA(cudaMemset(d_cycles, 0, sizeof(unsigned long long)));
@@ -253,9 +251,7 @@ int main(int argc, char** argv) {
             double sampled_gbps = 0.0, samp_ms = 0.0;
             if (sample_ms) {
                 nvhbi_flush_l2(t);
-                nvhbi_warm_chunks<<<t.sm_count * 8, 128>>>(
-                    t.d_data, d_list, 0u, chunks, t.d_sm_side, target_die, t.d_sink);
-                CHECK_CUDA(cudaGetLastError());
+                nvhbi_warm(t, d_list, 0u, chunks, target_die);
                 CHECK_CUDA(cudaDeviceSynchronize());
 
                 CHECK_CUDA(cudaMemset(d_prog, 0, sizeof(unsigned long long)));

@@ -114,9 +114,7 @@ int main(int argc, char** argv) {
             dim3 grid(t.sm_count * nbps), block(bs);
 
             nvhbi_flush_l2(t);
-            nvhbi_warm_chunks<<<t.sm_count * 8, 128>>>(
-                t.d_data, d_list, 0u, chunks, t.d_sm_side, target_die, t.d_sink);
-            CHECK_CUDA(cudaGetLastError());
+            nvhbi_warm(t, d_list, 0u, chunks, target_die);
             CHECK_CUDA(cudaDeviceSynchronize());
 
             CHECK_CUDA(cudaMemset(d_prog, 0, sizeof(unsigned long long)));

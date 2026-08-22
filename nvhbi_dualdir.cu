@@ -244,9 +244,7 @@ int main(int argc, char** argv) {
             // Only the write targets are warmed. The read sweep is far larger
             // than L2 by construction, so it comes from the source die's HBM.
             if (w_chunks) {
-                nvhbi_warm_chunks<<<t.sm_count * 8, 128>>>(
-                    t.d_data, d_wlist, 0u, w_chunks, t.d_sm_side, w_target_die, t.d_sink);
-                CHECK_CUDA(cudaGetLastError());
+                nvhbi_warm(t, d_wlist, 0u, w_chunks, w_target_die);
             }
             CHECK_CUDA(cudaDeviceSynchronize());
 

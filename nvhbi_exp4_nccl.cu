@@ -184,9 +184,7 @@ int main() {
             CHECK_CUDA(cudaSetDevice(0));
             nvhbi_flush_l2(t);
             if (bg_chunks) {
-                nvhbi_warm_chunks<<<t.sm_count * 8, 128>>>(
-                    t.d_data, d_bg_list, 0u, bg_chunks, t.d_sm_side, bg_die, t.d_sink);
-                CHECK_CUDA(cudaGetLastError());
+                nvhbi_warm(t, d_bg_list, 0u, bg_chunks, bg_die);
                 CHECK_CUDA(cudaDeviceSynchronize());
             }
 

@@ -330,9 +330,7 @@ int main() {
         CHECK_CUDA(cudaSetDevice(0));
         nvhbi_flush_l2(t);
         if (warm) {
-            nvhbi_warm_chunks<<<t.sm_count * 8, 128>>>(
-                t.d_data, die_list0(die), 0u, chunks, t.d_sm_side, die, t.d_sink);
-            CHECK_CUDA(cudaGetLastError());
+            nvhbi_warm(t, die_list0(die), 0u, chunks, die);
             CHECK_CUDA(cudaDeviceSynchronize());
         }
     };

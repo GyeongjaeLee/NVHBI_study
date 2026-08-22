@@ -141,9 +141,10 @@ __global__ void rp_warm_queue(unsigned int* __restrict__ data,
     nvhbi_st(&sink[smid], consume);
 }
 
-// Warm-up exactly as nvhbi_warm_chunks does it today, plus a visited flag. The
-// indexing is untouched, so the coverage this reports is the coverage every
-// experiment has actually been getting.
+// The OLD nvhbi_warm_chunks indexing, kept here on purpose as the A/B control
+// after the header switched to a work queue. Same die filter, plus a visited
+// flag. Whatever this reports below 100% is what every measurement taken before
+// that change was actually getting.
 __global__ void rp_warm_asis(unsigned int* __restrict__ data,
                              const unsigned int* __restrict__ idx_list,
                              unsigned int first, unsigned int count,
@@ -254,7 +255,11 @@ int main(int argc, char** argv) {
     const unsigned int trials      = env_u("NVHBI_RP_TRIALS", 5u);
     const unsigned int do_part_e   = env_u("NVHBI_RP_PART_E", 0u);
     const unsigned int bg_block    = env_u("NVHBI_RP_BG_BLOCK", 64u);
-    const unsigned int bg_nbps     = env_u("NVHBI_RP_BG_BLOCKS_PER_SM", 32u);
+    // 31, not 32, on purpose: PART E has to schedule a one-thread probe kernel
+    // onto an SM the background already occupies, and at 32 blocks/SM every
+    // block slot is taken and the probe would queue behind the whole background
+    // instead of running beside it. 31 x 64 = 1984 threads leaves one slot.
+    const unsigned int bg_nbps     = env_u("NVHBI_RP_BG_BLOCKS_PER_SM", 31u);
     const unsigned int settle_ms   = env_u("NVHBI_RP_SETTLE_MS", 100u);
     const double       buf_mult    = (double)env_u("NVHBI_BUF_MULT", 8u);
 
@@ -376,8 +381,8 @@ int main(int argc, char** argv) {
         printf("\n================= PART B: warm-up coverage =================\n");
         printf("die%u, %u chunks (%u SMs x %u blk/SM x %u thr -- exp1/exp2's top point)\n",
                target, count, nsm, bg_nbps, bg_block);
-        printf("  nvhbi_warm_chunks, as it is today : %6.1f%%\n", coverage(false));
-        printf("  same filter, work-queue split     : %6.1f%%\n", coverage(true));
+        printf("  old indexing (gwarp split)        : %6.1f%%\n", coverage(false));
+        printf("  work-queue split (now in the header): %5.1f%%\n", coverage(true));
         printf("  Both filter SMs by die identically. They differ only in how the\n"
                "  chunk list is split across warps. Any gap is chunks the stress\n"
                "  kernel writes into but nothing ever pulled into L2 -- and under\n"
@@ -656,7 +661,12 @@ int main(int argc, char** argv) {
 
             printf("\n========= PART E: peer latency under GPU0 load =========\n");
             printf("probe = GPU1 sm%d, one thread, so it adds no load of its own\n", sm1_of[0]);
-            printf("# RP,bg_mode,bg_sms,bg_GBps,lat_near,lat_far,d_near,d_far\n");
+            printf("own_far = GPU0's OWN die%u SM -> die%u L2, the same crossing the\n"
+                   "          background is loading. It is the discriminator: if the\n"
+                   "          congestion point is upstream of where NVLink joins the\n"
+                   "          fabric, own_far climbs while lat_far does not.\n",
+                   near_die, far_die);
+            printf("# RP,bg_mode,bg_sms,bg_GBps,lat_near,lat_far,own_far,d_near,d_far,d_own\n");
 
             for (int m = 0; m < 3; ++m)
             for (int bi = 0; bi < bg_n; ++bi) {
@@ -699,14 +709,17 @@ int main(int argc, char** argv) {
                     t_a = now_ms();
                 }
 
-                unsigned int lnear = ~0u, lfar = ~0u;
+                unsigned int lnear = ~0u, lfar = ~0u, lown = ~0u;
                 for (unsigned int r = 0; r < lat_rounds; ++r) {
                     const unsigned int a = atomic_lat(1, t0.d_data, list_on1[near_die],
                                                       sm1_of[0]);
                     const unsigned int b = atomic_lat(1, t0.d_data, list_on1[far_die],
                                                       sm1_of[0]);
+                    const unsigned int c = atomic_lat(0, t0.d_data, list0[far_die],
+                                                      sm0_of[near_die]);
                     if (a < lnear) lnear = a;
                     if (b < lfar)  lfar  = b;
+                    if (c < lown)  lown  = c;
                 }
 
                 CHECK_CUDA(cudaSetDevice(0));
@@ -719,18 +732,28 @@ int main(int argc, char** argv) {
                     CHECK_CUDA(cudaStreamSynchronize(s_bg));
                 }
 
-                printf("RP,%d,%u,%.1f,%u,%u,%+d,%+d\n",
-                       m + 1, bg_sms, bg_gbps, lnear, lfar,
+                printf("RP,%d,%u,%.1f,%u,%u,%u,%+d,%+d,%+d\n",
+                       m + 1, bg_sms, bg_gbps, lnear, lfar, lown,
                        (int)lnear - (int)L1[0][near_die],
-                       (int)lfar  - (int)L1[0][far_die]);
+                       (int)lfar  - (int)L1[0][far_die],
+                       (int)lown  - (int)L0[near_die][far_die]);
                 fflush(stdout);
             }
 
-            printf("\nd_far grows with bg_sms in mode 1 but not in mode 2 -> the peer\n"
-                   "really shares the A->B NV-HBI link. Grows in both -> what it queues\n"
-                   "behind is the far die's L2. Flat in every mode -> the peer's path\n"
-                   "does not touch either resource. d_near is the within-run control and\n"
-                   "should stay put; if it tracks d_far the effect is at NVLink ingress.\n");
+            printf("\nRead d_own first: it is GPU0's own SMs measuring the very crossing\n"
+                   "the background saturates, so in mode 1 it MUST climb. If it does not,\n"
+                   "the background is not congesting a die crossing at all and nothing\n"
+                   "else in this table means anything.\n"
+                   "Then, with d_own climbing in mode 1:\n"
+                   "  d_far climbs too, d_near flat   -> the peer shares the A->B link.\n"
+                   "  d_far flat while d_own climbs   -> the peer joins the fabric\n"
+                   "     DOWNSTREAM of the congestion. The 3.44 TB/s plateau is then the\n"
+                   "     writer die's L2->fabric egress, not the die link, which is\n"
+                   "     exactly why adding 630 GB/s of NVLink traffic costs nothing.\n"
+                   "  d_far and d_near climb together -> the effect is at NVLink ingress\n"
+                   "     on GPU0, common to both dies.\n"
+                   "Mode 2 (B->B local) loads the far die's L2 without touching the link,\n"
+                   "so anything that moves in mode 1 and not in mode 2 is the link.\n");
 
             CHECK_CUDA(cudaFree(d_prog));
             CHECK_CUDA(cudaStreamDestroy(s_bg));

@@ -146,14 +146,23 @@ __global__ void nvhbi_find_sm_side(unsigned int* __restrict__ data,
     const unsigned int smid = nvhbi_smid();
     if (smid != (unsigned int)target_smid || threadIdx.x != 0) return;
     unsigned int consume = 0;
+    // MIN over the samples, not the last one. The classifier downstream splits
+    // on |lat[i] - lat[0]| < 100 cycles against a hop that measures ~360, so
+    // the window is wide -- but one noisy final sample used to be enough to
+    // flip an SM to the wrong die, and a misclassified SM then writes across
+    // the die boundary in exp1 while being counted as own-die (or vice versa),
+    // and shifts sms_p0/sms_p1 so the top of the SM sweep moves too.
+    unsigned int best = ~0u;
 #pragma unroll 1
     for (int r = 0; r < 100; r++) {
         unsigned long long start = clock64();
         consume += data[0];
         unsigned long long end = clock64();
         atomicAdd(&data[0], 1);
-        latency_out[smid] = (unsigned int)(end - start);
+        const unsigned int cyc = (unsigned int)(end - start);
+        if (cyc < best) best = cyc;
     }
+    latency_out[smid] = best;
     __stcg(&sink[smid], consume);
 }
 
@@ -206,22 +215,39 @@ __global__ void nvhbi_flush_kernel(unsigned int* __restrict__ buf, size_t n,
 // Only SMs of `owner_partition` participate, so no copy is created on the far
 // die. Each (chunk, lane) pair loads the same 4 lines the stress kernels store
 // to, which is exactly what write-no-allocate needs to turn stores into hits.
+//
+// Warps pull chunk ids from a shared cursor rather than deriving them from a
+// global warp index. That split is what makes the die filter above safe: with
+// `c = gwarp; c += gridDim*blockDim/32` every chunk belongs to exactly ONE
+// launched warp, and the ~half of those warps sitting on the other die return
+// at the line above without ever claiming theirs. Measured on a 148-SM B200
+// with a 72-SM target partition: 48.7% of the list loaded, i.e. exactly
+// 72/148 -- the coverage tracked the participating-SM fraction, which is the
+// signature of the bug and not of the (correct, deliberate) die filter. The
+// stress kernel meanwhile indexes with sm_rank = sm_side[smid]/2, a DENSE rank
+// inside the partition, so it writes [0,count) with no gaps. Half its stores
+// were therefore landing on lines nothing had pulled in, and under
+// write-no-allocate those go to HBM instead of the target die's L2.
+//
+// Callers go through nvhbi_warm(), which owns the cursor and zeroes it.
 __global__ void nvhbi_warm_chunks(unsigned int* __restrict__ data,
                                   const unsigned int* __restrict__ idx_list,
                                   unsigned int first,
                                   unsigned int count,
                                   const unsigned int* __restrict__ sm_side,
                                   unsigned int owner_partition,
+                                  unsigned int* __restrict__ cursor,
                                   unsigned int* __restrict__ sink) {
     const unsigned int smid = nvhbi_smid();
     if ((sm_side[smid] % 2u) != owner_partition) return;
 
     const unsigned int lane = threadIdx.x % 32u;
-    const unsigned int gwarp = (blockIdx.x * blockDim.x + threadIdx.x) / 32u;
-    const unsigned int nwarps = (gridDim.x * blockDim.x) / 32u;
-
     unsigned int consume = 0u;
-    for (unsigned int c = gwarp; c < count; c += nwarps) {
+    for (;;) {
+        unsigned int c = 0u;
+        if (lane == 0u) c = atomicAdd(cursor, 1u);
+        c = __shfl_sync(0xffffffffu, c, 0);
+        if (c >= count) break;
         unsigned int* a[4];
         nvhbi_lane_addrs(data, idx_list[first + c], lane, a);
         consume += nvhbi_ld(a[0]);
@@ -664,6 +690,7 @@ struct NvhbiTopo {
     unsigned int   sms_p1      = 0;
 
     unsigned int*  d_sink      = nullptr;
+    unsigned int*  d_warm_cursor = nullptr;   // work queue head for nvhbi_warm
     unsigned int*  d_flush     = nullptr;
     size_t         flush_ints  = 0;
 
@@ -681,6 +708,22 @@ static inline unsigned int nvhbi_default_threshold() {
 static void nvhbi_flush_l2(const NvhbiTopo& t) {
     nvhbi_flush_kernel<<<t.sm_count * 32, 256>>>(t.d_flush, t.flush_ints, t.d_sink);
     CHECK_CUDA(cudaDeviceSynchronize());
+}
+
+// Warm chunks [first, first+count) of `d_list` into the L2 of the die that owns
+// them, using only that die's SMs. Resets the work-queue cursor first, so the
+// coverage is the whole range every time. Issued on the default stream, like
+// the raw launch it replaces, so an existing cudaDeviceSynchronize() at the
+// call site still orders it.
+static void nvhbi_warm(const NvhbiTopo& t, const unsigned int* d_list,
+                       unsigned int first, unsigned int count,
+                       unsigned int owner_partition) {
+    if (!count) return;
+    CHECK_CUDA(cudaMemset(t.d_warm_cursor, 0, sizeof(unsigned int)));
+    nvhbi_warm_chunks<<<t.sm_count * 8, 128>>>(t.d_data, d_list, first, count,
+                                               t.d_sm_side, owner_partition,
+                                               t.d_warm_cursor, t.d_sink);
+    CHECK_CUDA(cudaGetLastError());
 }
 
 // buf_mult: allocation size as a multiple of L2 size. Bigger = more chunks per
@@ -713,6 +756,7 @@ static void nvhbi_probe(NvhbiTopo& t, int device, double buf_mult, bool verbose 
 
     CHECK_CUDA(cudaMalloc(&t.d_sink, t.sm_count * sizeof(unsigned int)));
     CHECK_CUDA(cudaMemset(t.d_sink, 0, t.sm_count * sizeof(unsigned int)));
+    CHECK_CUDA(cudaMalloc(&t.d_warm_cursor, sizeof(unsigned int)));
 
     t.flush_ints = (t.l2_bytes * 2) / sizeof(unsigned int);
     CHECK_CUDA(cudaMalloc(&t.d_flush, t.flush_ints * sizeof(unsigned int)));
@@ -797,6 +841,7 @@ static void nvhbi_free(NvhbiTopo& t) {
     if (t.d_far_idx)  CHECK_CUDA(cudaFree(t.d_far_idx));
     if (t.d_near_idx) CHECK_CUDA(cudaFree(t.d_near_idx));
     if (t.d_sink)     CHECK_CUDA(cudaFree(t.d_sink));
+    if (t.d_warm_cursor) CHECK_CUDA(cudaFree(t.d_warm_cursor));
     if (t.d_flush)    CHECK_CUDA(cudaFree(t.d_flush));
     free(t.h_far_idx);
     free(t.h_near_idx);
