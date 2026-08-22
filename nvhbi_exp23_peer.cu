@@ -521,7 +521,7 @@ int main(int argc, char** argv) {
             t.d_data, t.d_far_idx, t.d_near_idx, t.d_sm_side,
             bg_writer_partition, bg_local, tsms, bg_nbps,
             (unsigned int)t.sm_count, bg_lines, 0u,
-            0u, dl, stop.d, d_bg_prog, d_bg_cyc, t.d_sink);
+            0u, dl, stop.d, d_bg_prog, d_bg_cyc, nullptr, t.d_sink);
         CHECK_CUDA(cudaGetLastError());
         printf("# TRACE,t_ms,interval_GBps   (background alone, %u SMs)\n", tsms);
         unsigned long long prev = 0ull;
@@ -589,7 +589,7 @@ int main(int argc, char** argv) {
                     t.d_data, t.d_far_idx, t.d_near_idx, t.d_sm_side,
                     bg_writer_partition, bg_local, bg_sms, bg_nbps,
                     (unsigned int)t.sm_count, bg_lines, 0u,
-                    0u, dl, stop.d, d_bg_prog, d_bg_cyc, t.d_sink);
+                    0u, dl, stop.d, d_bg_prog, d_bg_cyc, nullptr, t.d_sink);
                 CHECK_CUDA(cudaGetLastError());
                 bg_launch_ms = now_ms();
                 spin_ms(100.0);

@@ -200,7 +200,7 @@ int main() {
                     t.d_data, t.d_far_idx, t.d_near_idx, t.d_sm_side,
                     /*writer_partition=*/0u, bg_local, bg_sms, bg_nbps,
                     (unsigned int)t.sm_count, bg_lines, /*chunk_offset=*/0u,
-                    /*iteration=*/0u, dl, stop.d, d_bg_prog, nullptr, t.d_sink);
+                    /*iteration=*/0u, dl, stop.d, d_bg_prog, nullptr, nullptr, t.d_sink);
                 CHECK_CUDA(cudaGetLastError());
                 spin_ms(100.0);
             }

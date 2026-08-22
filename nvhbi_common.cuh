@@ -268,6 +268,7 @@ __global__ void nvhbi_stress_write(unsigned int* __restrict__ data,
                                    const unsigned int* __restrict__ stop_flag,
                                    unsigned long long* __restrict__ progress,
                                    unsigned long long* __restrict__ cycles_out,
+                                   unsigned long long* __restrict__ cycles_min_out,
                                    unsigned int* __restrict__ sink) {
     const unsigned int smid = nvhbi_smid();
     if ((sm_side[smid] % 2u) != writer_partition) return;
@@ -365,8 +366,18 @@ __global__ void nvhbi_stress_write(unsigned int* __restrict__ data,
     // GHz on a GPU nvidia-smi held pinned at 1.965 GHz, and the figure halved
     // when block_size doubled, because that one thread stops representing the
     // kernel as soon as occupancy changes. Callers must zero *cycles_out first.
+    //
+    // The SHORTEST span alongside it measures how unevenly the fabric shared
+    // itself out. It exists to explain a 17% disagreement between this program's
+    // two harnesses: a fixed-iteration run is timed by its SLOWEST warp, while a
+    // deadline run sampled mid-flight sees the aggregate rate with every warp
+    // still active. If min/max is ~1 the two must agree; the more it falls below
+    // 1, the more the fixed-iteration number is dragged down by a tail of warps
+    // finishing alone. Callers must set *cycles_min_out to all-ones first.
     if (cycles_out && lane == 0u)
         atomicMax(cycles_out, (unsigned long long)(clock64() - t0));
+    if (cycles_min_out && lane == 0u)
+        atomicMin(cycles_min_out, (unsigned long long)(clock64() - t0));
     nvhbi_st(&sink[smid], val);
 }
 

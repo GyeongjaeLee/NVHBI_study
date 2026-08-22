@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
                 wp, own_die, nsm, nbps, (unsigned int)t.sm_count,
                 L, /*chunk_offset=*/0u,
                 iteration, /*deadline=*/0ull, /*stop_flag=*/nullptr,
-                d_prog, /*cycles_out=*/nullptr, t.d_sink);
+                d_prog, /*cycles_out=*/nullptr, /*cycles_min_out=*/nullptr, t.d_sink);
             CHECK_CUDA(cudaEventRecord(e1));
             CHECK_CUDA(cudaGetLastError());
             CHECK_CUDA(cudaDeviceSynchronize());

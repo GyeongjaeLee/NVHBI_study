@@ -29,14 +29,16 @@ NCCL_LIB  := $(if $(NCCL_SO),$(NCCL_SO),$(if $(NCCL_HOME),-L$(NCCL_HOME)/lib,) -
 NCCL_RPATH := $(if $(NCCL_HOME),-Xlinker -rpath -Xlinker $(NCCL_HOME)/lib,)
 
 BINS      := nvhbi_exp1_bisection nvhbi_exp23_peer nvhbi_dualdir nvhbi_peerl2
+PROBES    := nvhbi_route_probe
 NCCL_BIN  := nvhbi_exp4_nccl
 
-.PHONY: all nccl clean nccl-probe
+.PHONY: all nccl clean nccl-probe probes
 
 all: $(BINS)
+probes: $(PROBES)
 nccl: $(NCCL_BIN)
 
-$(BINS): %: %.cu nvhbi_common.cuh
+$(BINS) $(PROBES): %: %.cu nvhbi_common.cuh
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
 nvhbi_validate_counter: nvhbi_validate_counter.cu nvhbi_common.cuh
@@ -62,4 +64,4 @@ nccl-probe:
 	@echo "link flags = $(NCCL_INC) $(NCCL_LIB) $(NCCL_RPATH)"
 
 clean:
-	rm -f $(BINS) $(NCCL_BIN) nvhbi_validate_counter
+	rm -f $(BINS) $(PROBES) $(NCCL_BIN) nvhbi_validate_counter

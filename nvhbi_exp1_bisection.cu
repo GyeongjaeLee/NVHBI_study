@@ -55,11 +55,20 @@
 //   NVHBI_ITER_HI       default 6000
 //   NVHBI_BLOCKS_PER_SM default 32
 //   NVHBI_BUF_MULT      default 8
+//   NVHBI_SAMPLE_MS     sampled-rate window in ms, 0 = off. default 200
+//   NVHBI_SAMPLE_SETTLE_MS  settle before sampling,        default 100
 //   NVHBI_LAT_THRESHOLD probe threshold in cycles, default 500
 //
 // argv: [writer_partition]   0 | 1 | 2(=both, default)
 
 #include "nvhbi_common.cuh"
+#include <chrono>
+
+static double now_ms() {
+    using namespace std::chrono;
+    return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
+}
+static void spin_ms(double ms) { const double u = now_ms() + ms; while (now_ms() < u) {} }
 
 static int parse_list(const char* env, const char* dflt, unsigned int* out, int cap) {
     const char* s = getenv(env);
@@ -87,6 +96,10 @@ int main(int argc, char** argv) {
     const unsigned int iter_lo  = env_u("NVHBI_ITER_LO", 2000u);
     const unsigned int iter_hi  = env_u("NVHBI_ITER_HI", 6000u);
     const double       buf_mult = (double)env_u("NVHBI_BUF_MULT", 8u);
+    // Second harness, run on the same configuration right after the slope pair.
+    // See the SAMPLED RATE note at the top. 0 disables it.
+    const unsigned int sample_ms = env_u("NVHBI_SAMPLE_MS", 200u);
+    const unsigned int settle_ms = env_u("NVHBI_SAMPLE_SETTLE_MS", 100u);
 
     if (iter_hi <= iter_lo) {
         fprintf(stderr, "ERROR: NVHBI_ITER_HI (%u) must exceed NVHBI_ITER_LO (%u)\n",
@@ -106,7 +119,8 @@ int main(int argc, char** argv) {
     printf("  two-point slope: iteration %u vs %u\n", iter_lo, iter_hi);
     printf("# CFG,writer_partition,own_die,num_active_sm,num_blocks_per_sm,block_size,"
            "footprint_MB,sectors_lo,sectors_hi,ms_lo,ms_hi,"
-           "naive_GBps,slope_GBps,counted_GBps,count_ratio,overhead_ms,eff_GHz\n");
+           "naive_GBps,slope_GBps,counted_GBps,count_ratio,overhead_ms,eff_GHz,"
+           "span_ratio,sampled_GBps,sample_ms\n");
 
     const unsigned int p_lo = (arg_partition <= 1u) ? arg_partition : 0u;
     const unsigned int p_hi = (arg_partition <= 1u) ? arg_partition : 1u;
@@ -122,6 +136,22 @@ int main(int argc, char** argv) {
     // so count here too and publish the ratio rather than assume.
     unsigned long long* d_prog = nullptr;
     CHECK_CUDA(cudaMalloc(&d_prog, sizeof(unsigned long long)));
+    // Shortest warp span, to sit next to the longest one in d_cycles. Their ratio
+    // is how evenly the fabric shared itself out, and it is the explanation for
+    // this program reading 17% below exp2/dualdir at saturation while agreeing
+    // with them to 0.3% below it: a fixed-iteration kernel is timed by its
+    // SLOWEST warp, so a spread-out tail drags the whole number down. Compare
+    // span_ratio against exp1_GBps / exp2_GBps at the same point.
+    unsigned long long* d_cyc_min = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_cyc_min, sizeof(unsigned long long)));
+    // The sampled harness needs the kernel to stay resident while the host reads
+    // its counter, so it goes on a non-blocking stream with the same stop flag
+    // exp2/3 use. Everything else about the launch is identical to the slope
+    // pair above -- same grid, same block, same store stream.
+    cudaStream_t s_meas;
+    CHECK_CUDA(cudaStreamCreateWithFlags(&s_meas, cudaStreamNonBlocking));
+    NvhbiStopFlag stop;
+    nvhbi_stop_flag_create(stop);
 
     for (unsigned int wp = p_lo; wp <= p_hi; ++wp) {
     for (int oi = 0; oi < od_n; ++oi) {
@@ -169,6 +199,7 @@ int main(int argc, char** argv) {
             dim3 grid(t.sm_count * nbps), block(block_size);
             float ms[2] = {0.f, 0.f};
             unsigned long long cyc[2] = {0ull, 0ull};
+            unsigned long long cmin[2] = {0ull, 0ull};
             unsigned long long cnt[2] = {0ull, 0ull};
             const unsigned int iters[2] = {iter_lo, iter_hi};
 
@@ -183,13 +214,14 @@ int main(int argc, char** argv) {
 
                 CHECK_CUDA(cudaMemset(d_cycles, 0, sizeof(unsigned long long)));
                 CHECK_CUDA(cudaMemset(d_prog, 0, sizeof(unsigned long long)));
+                CHECK_CUDA(cudaMemset(d_cyc_min, 0xff, sizeof(unsigned long long)));
                 CHECK_CUDA(cudaEventRecord(e0));
                 nvhbi_stress_write<<<grid, block>>>(
                     t.d_data, t.d_far_idx, t.d_near_idx, t.d_sm_side,
                     wp, own_die, nsm, nbps, (unsigned int)t.sm_count,
                     /*lines_mult=*/1u, /*chunk_offset=*/0u,
                     iters[k], /*deadline=*/0ull, /*stop_flag=*/nullptr,
-                    d_prog, d_cycles, t.d_sink);
+                    d_prog, d_cycles, d_cyc_min, t.d_sink);
                 CHECK_CUDA(cudaEventRecord(e1));
                 CHECK_CUDA(cudaGetLastError());
                 CHECK_CUDA(cudaDeviceSynchronize());
@@ -198,9 +230,70 @@ int main(int argc, char** argv) {
                                       cudaMemcpyDeviceToHost));
                 CHECK_CUDA(cudaMemcpy(&cnt[k], d_prog, sizeof(cnt[k]),
                                       cudaMemcpyDeviceToHost));
+                CHECK_CUDA(cudaMemcpy(&cmin[k], d_cyc_min, sizeof(cmin[k]),
+                                      cudaMemcpyDeviceToHost));
+            }
+
+            /* ---- SAMPLED RATE: exp2/exp3's statistic, on exp1's configuration ----
+               The slope pair above times the kernel with cudaEvents, so its
+               denominator is when the LAST warp finished. Under a saturated
+               fabric the arbitration is not fair, and a warp that is served 20%
+               below the mean stays 20% behind for the whole run -- its deficit
+               grows with the iteration count, so the two-point slope cannot
+               cancel it the way it cancels launch and drain. That is why this
+               program reads ~3.0 TB/s at 74 SMs where exp2's background reads
+               ~3.4 TB/s on the identical kernel, and why the two agree to 0.2%
+               below saturation, where there is no spread to be timed by.
+               `slope_GBps` therefore reports the SLOWEST warp's rate; exp2
+               reports the MEAN rate while every warp is still running.
+               Neither is wrong, but only one of them can be compared to exp2,
+               so measure it here too: run the same kernel to a deadline and
+               divide the counter delta by wall time, exactly as exp2 does.
+               sampled_GBps should match exp2's bg_GBps at the same SM count. */
+            double sampled_gbps = 0.0, samp_ms = 0.0;
+            if (sample_ms) {
+                nvhbi_flush_l2(t);
+                nvhbi_warm_chunks<<<t.sm_count * 8, 128>>>(
+                    t.d_data, d_list, 0u, chunks, t.d_sm_side, target_die, t.d_sink);
+                CHECK_CUDA(cudaGetLastError());
+                CHECK_CUDA(cudaDeviceSynchronize());
+
+                CHECK_CUDA(cudaMemset(d_prog, 0, sizeof(unsigned long long)));
+                nvhbi_stop_flag_reset(stop);
+                const unsigned long long dl =
+                    (unsigned long long)(2u * sample_ms + settle_ms + 2000u)
+                    * (unsigned long long)t.clock_khz;
+                nvhbi_stress_write<<<grid, block, 0, s_meas>>>(
+                    t.d_data, t.d_far_idx, t.d_near_idx, t.d_sm_side,
+                    wp, own_die, nsm, nbps, (unsigned int)t.sm_count,
+                    /*lines_mult=*/1u, /*chunk_offset=*/0u,
+                    /*iteration=*/0u, dl, stop.d,
+                    d_prog, nullptr, nullptr, t.d_sink);
+                CHECK_CUDA(cudaGetLastError());
+                spin_ms((double)settle_ms);
+
+                // Stamp the clock immediately AFTER each copy returns, at both
+                // ends, so the same bias sits on each and cancels in the
+                // interval. Reading the counter before starting the clock at one
+                // end and after stopping it at the other is what inflates a
+                // counter-over-wall-time rate.
+                unsigned long long q0 = 0ull, q1 = 0ull;
+                CHECK_CUDA(cudaMemcpy(&q0, d_prog, sizeof(q0), cudaMemcpyDeviceToHost));
+                const double ta = now_ms();
+                spin_ms((double)sample_ms);
+                CHECK_CUDA(cudaMemcpy(&q1, d_prog, sizeof(q1), cudaMemcpyDeviceToHost));
+                const double tb = now_ms();
+
+                nvhbi_stop_flag_set(stop);
+                CHECK_CUDA(cudaStreamSynchronize(s_meas));
+                samp_ms = tb - ta;
+                sampled_gbps = (samp_ms > 0.0)
+                    ? (double)(q1 - q0) * 32.0 / (samp_ms * 1e-3) / 1e9 : 0.0;
             }
 
             const double eff_ghz = (ms[1] > 0.f) ? (double)cyc[1] / (ms[1] * 1e6) : 0.0;
+            const double span_ratio = (cyc[1] > 0ull && cmin[1] != ~0ull)
+                ? (double)cmin[1] / (double)cyc[1] : 0.0;
 
             // 4 sectors per lane per iteration, 32B of fabric traffic each.
             const double sec_per_iter = (double)nsm * nbps * block_size * 4.0;
@@ -218,11 +311,12 @@ int main(int argc, char** argv) {
             const double overhead_ms = (slope_gbps > 0.0)
                 ? ms[1] - (sec_hi * 32.0 / (slope_gbps * 1e9)) * 1e3 : 0.0;
 
-            printf("CFG,%u,%u,%u,%u,%u,%.2f,%.0f,%.0f,%.4f,%.4f,%.2f,%.2f,%.2f,%.4f,%.4f,%.3f\n",
+            printf("CFG,%u,%u,%u,%u,%u,%.2f,%.0f,%.0f,%.4f,%.4f,%.2f,%.2f,%.2f,%.4f,%.4f,%.3f,%.4f,%.2f,%.2f\n",
                    wp, own_die, nsm, nbps, block_size,
                    nvhbi_footprint_mb(nsm, nbps, block_size, 1u),
                    sec_lo, sec_hi, ms[0], ms[1],
-                   naive_gbps, slope_gbps, counted_gbps, count_ratio, overhead_ms, eff_ghz);
+                   naive_gbps, slope_gbps, counted_gbps, count_ratio, overhead_ms,
+                   eff_ghz, span_ratio, sampled_gbps, samp_ms);
             fflush(stdout);
         }}
     }}
@@ -230,7 +324,10 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaEventDestroy(e0));
     CHECK_CUDA(cudaEventDestroy(e1));
     CHECK_CUDA(cudaFree(d_cycles));
+    CHECK_CUDA(cudaFree(d_cyc_min));
     CHECK_CUDA(cudaFree(d_prog));
+    CHECK_CUDA(cudaStreamDestroy(s_meas));
+    nvhbi_stop_flag_destroy(stop);
     nvhbi_free(t);
     return 0;
 }
