@@ -1,85 +1,63 @@
 // nvhbi_exp23_peer.cu -- EXPERIMENTS 2 and 3
 //
-// Two GPUs over NVLink. We do NOT assume which die NVLink attaches to -- we
-// measure it (a CALIBRATION phase), then orient everything around the result.
+// Does NVLink traffic entering GPU0 contend with GPU0's own cross-die traffic
+// on NV-HBI?
 //
-//   NEAR die  A = the die GPU1 reaches over NVLink without an NV-HBI hop
-//   FAR  die  B = the other die (one extra NV-HBI hop from GPU1)
+//   NEAR die A = the die GPU1 reaches over NVLink without an NV-HBI hop
+//   FAR  die B = the other die (one extra NV-HBI hop from GPU1)
 //
 //   exp2  peer -> B (far)  : peer traffic crosses NV-HBI, in the SAME direction
-//                            as the background load
+//                            as the background
 //   exp3  peer -> A (near) : same NVLink load, no NV-HBI crossing: the CONTROL
 //
-// The background load is oriented A -> B (die-A SMs writing into die-B memory),
-// so that exp2's peer traffic (which enters at A and crosses to B) shares the
-// exact same bisection link and direction as the background. This is what makes
-// exp2 vs exp3 an isolation of the NV-HBI hop rather than of NVLink.
+// Which die is which is MEASURED, not assumed -- see the CALIBRATION block.
+// nvhbi_route_probe checks the same thing more thoroughly and also confirms
+// that a peer write really lands in the far die's L2.
 //
-// How the probe bandwidth is measured (there is no ncu here)
-// ----------------------------------------------------------
-// ncu serializes+replays profiled kernels and would destroy the concurrency, and
-// no hardware counter reports NV-HBI traffic live. So every writing kernel keeps
-// an in-kernel counter of the 4B stores it issued; the host reads it before and
-// after a fixed time window and divides by wall time. When the fabric is the
-// bottleneck the store-issue rate equals the fabric drain rate, so:
+// The background is oriented A -> B (die-A SMs writing die-B memory) so exp2's
+// peer traffic shares the same link and direction. NVHBI_BG_R_SMS adds crossing
+// READS to it, issued by die-B SMs pulling from die A: that payload travels
+// A->B too, which is how the background is driven past what die A's stores
+// alone can drive.
 //
-//     achieved bandwidth = issued_stores * 32B / window
-//
-// The "store == one 32B remote sector" identity is the same one exp1 calibrates
-// against ncu (its sector_ratio column). The BACKGROUND bandwidth is the probe
-// of remaining bisection; the peer load is the independent variable.
-//
-// PHYSICS CAVEAT worth stating up front: NV-HBI (die-to-die) bandwidth is far
-// larger than a single GPU's NVLink budget. One peer GPU alone cannot dent the
-// bisection; the effect only appears once the on-GPU0 background has driven
-// NV-HBI near its ceiling, and even then the peer can take at most ~NVLink worth
-// of it. Push bg_sms to the maximum for exp2/2c to show anything.
+// MEASUREMENT -- one window, one method, every stream
+// ---------------------------------------------------
+// ncu serializes and replays profiled kernels and would destroy the
+// concurrency, and no hardware counter reports NV-HBI traffic live. So every
+// kernel keeps an in-kernel counter of the 32B sectors it issued, and the host
+// samples ALL of them at the same two instants and divides by the same elapsed
+// time. Background writes, background reads and the peer are therefore the same
+// statistic over the same interval, and comparable with exp1's sampled_GBps and
+// with nvhbi_dualdir.
 //
 // argv: [exp 2|3]   (2 -> peer targets far, 3 -> peer targets near)
 //
 // Env: NVHBI_FAR_DIE            override auto-detection (0 or 1)
-//      NVHBI_BG_SMS_LIST        background SM counts, 0=off. default "0,16,32,64,74"
-//      NVHBI_PEER_BLOCKS_PER_SM peer blocks per SM, FIXED across the sweep. default 32
-//                               (the same convention as NVHBI_BG_BLOCKS_PER_SM).
-//                               The launched grid is sm_count x this, clamped to
-//                               what stays resident -- see the note below.
-//      NVHBI_PEER_BLOCK_SIZES   peer block sizes, 0=off. default "0,1,2,4,8,16,32,64,128"
-//                               This is the swept axis. Below 32 it varies the
-//                               ACTIVE LANES PER WARP, i.e. how many 32B sectors
-//                               one store instruction touches (1..32); above 32
-//                               it varies warps per block (1..4). One continuous
-//                               injection ramp from 32 threads to 4096.
-//      NVHBI_BG_LOCAL           1 = background stays on die A (control), default 0
-//      NVHBI_BG_R_SMS           crossing READS added to the background, issued by
-//                               the far die's SMs pulling from the near die --
-//                               same direction as the background writes and the
-//                               peer. A LIST, e.g. "0,8,16,32,64,76". 0 = the
-//                               write-only background. Needs NVHBI_BUF_MULT=64:
-//                               reads must stream over far more than L2 or the
-//                               reading die's replicas serve them and nothing
-//                               crosses. bg_sms=0 with readers gives read-alone
-//                               rows. Ignored for bg_local=1 (nvhbi_dual has no
-//                               own-die write mode, so that would not be a
-//                               control).
+//      NVHBI_BG_SMS_LIST        background writer SM counts, 0=off.
+//                               default "0,16,32,64,74"; clamped to the die
+//      NVHBI_BG_R_SMS           background crossing-READ SM counts, a LIST
+//      NVHBI_BG_R_LOCAL         1 = those readers read their OWN die (control)
+//      NVHBI_BG_LOCAL           1 = background writers stay on die A (control)
+//      NVHBI_PEER_BLOCK_SIZES   peer block sizes, 0=off. The injection axis:
+//                               below 32 it sets active lanes per warp (=
+//                               sectors per store instruction), above 32 it
+//                               sets warps per block.
+//                               default "0,1,2,4,8,16,32,64,128"
+//      NVHBI_PEER_BLOCKS_PER_SM peer blocks per SM, clamped to what stays
+//                               resident. default 32
+//      NVHBI_PEER_CHUNKS        peer footprint in 4KiB chunks. 0 = one chunk
+//                               per injecting warp at the widest sweep point.
+//      NVHBI_PEER_IDLE          spin cycles after each store group, 0 = full
+//                               rate: the continuous injection-rate knob.
+//      NVHBI_PEER_OVERLAP       1 = peer writes the SAME chunks as the
+//                               background instead of a disjoint region.
+//      NVHBI_TAG_CHECK          1 = stamp each writer and count who owns each
+//                               sector of the shared range. Use with OVERLAP=1.
+//      NVHBI_WINDOW_MS / _SETTLE_MS / NVHBI_REPEAT   default 200 / 100 / 3
+//      NVHBI_PEER_MARGIN_MS     how long the peer's deadline outlasts the
+//                               window; it has no stop flag. default 60
 //      NVHBI_HBM_PER_DIE_GBPS   plausibility bound on bg_rd_GBps, default 4000
-//                               (4 HBM3e stacks x ~1 TB/s). A read above it is
-//                               replicas being counted as crossings.
-//      NVHBI_WINDOW_MS          measurement window per point, default 200
-//      NVHBI_REPEAT             reps per point,               default 3
-//      NVHBI_PEER_CHUNKS        peer footprint in 4KiB chunks. 0 (default) sizes
-//                               it automatically to one chunk per injecting warp
-//                               at the widest point of the sweep -- a warp with no
-//                               chunk of its own contributes nothing.
-//      NVHBI_BG_BLOCK / NVHBI_BG_BLOCKS_PER_SM / NVHBI_BG_LINES
-//      NVHBI_PEER_IDLE          spin cycles after each store group, 0 = full rate.
-//                               The continuous injection-rate knob; use it to get
-//                               sub-saturation points on the NVLink-load axis.
-//      NVHBI_TAG_CHECK          1 = stamp each writer's stores and count, after
-//                               every window, who owns each sector of the shared
-//                               range. Prints TAG rows. Use with PEER_OVERLAP=1.
-//      NVHBI_PEER_OVERLAP       1 = peer writes the SAME chunks the background
-//                               writes, 0 (default) = a disjoint region.
-//      NVHBI_BUF_MULT           default 8
+//      NVHBI_BUF_MULT           allocation as a multiple of L2, default 8
 
 #include "nvhbi_common.cuh"
 #include <chrono>
@@ -118,53 +96,26 @@ int main(int argc, char** argv) {
     const unsigned int bg_nbps   = env_u("NVHBI_BG_BLOCKS_PER_SM", 32u);
     const unsigned int bg_lines  = env_u("NVHBI_BG_LINES", 1u);
     const unsigned int bg_local  = env_u("NVHBI_BG_LOCAL", 0u);
-    // Crossing READS added to the background, issued by the FAR die's SMs
-    // pulling from the NEAR die. The payload travels near->far, the same
-    // direction as the background writes and the same direction as the peer, so
-    // all three load one direction of NV-HBI -- and reads are how you get past
-    // what one die's SMs can push with stores alone.
-    //
-    // This exists because the write-only background tops out around 3.4 TB/s
-    // while nvhbi_dualdir showed the direction carrying more than that, so
-    // bg + peer never reached the fabric's capacity and "no interference" was
-    // the expected answer under every hypothesis. With readers the background
-    // can saturate first, and only then does the peer's 630 GB/s have to
-    // displace something -- or visibly fail to, which is the real result.
-    //
-    // Reads must stream over a footprint far larger than L2 or the requester
-    // die's read-only replicas serve them and nothing crosses: run this with
-    // NVHBI_BUF_MULT=64, not the default 8.
-    // Swept, not a single value. A single point could not be reconciled against
-    // nvhbi_dualdir: at a nominal 16 readers dualdir reads 4260 GB/s of crossing
-    // traffic and this program read 3171 -- which is dualdir's 64-to-72 reader
-    // PLATEAU, not its 16-reader peak. The write-only baselines agree exactly
-    // (3440 both), so the writers are fine and the disagreement is on the read
-    // side. Sweeping, plus the read-alone rows that bg_sms=0 now produces,
-    // compares the two harnesses point by point instead of at one guess.
+    // Crossing READS added to the background: far-die SMs pulling from the
+    // near die, so the payload travels near->far like the writes and the peer.
+    // This is how the background is driven past what one die's stores can
+    // drive. A LIST, so the whole curve is visible; bg_sms=0 with readers gives
+    // read-alone rows. Reads must stream over far more than L2 or the reading
+    // die's replicas serve them and nothing crosses -- use NVHBI_BUF_MULT=64.
     const unsigned int window_ms = env_u("NVHBI_WINDOW_MS", 200u);
     // Every stream is launched, allowed to settle, then sampled over ONE shared
     // window. peer_margin_ms is how much longer the peer's deadline runs past
-    // that window (nvhbi_peer_write has no stop flag, so it drains on its own).
+    // that window; nvhbi_peer_write has no stop flag, so it drains on its own.
     const unsigned int settle_ms = env_u("NVHBI_SETTLE_MS", 100u);
     const unsigned int peer_margin_ms = env_u("NVHBI_PEER_MARGIN_MS", 60u);
-    // Readers stay on their own die. Nothing crosses on the read side, so the
-    // SAME kernel and the SAME accounting measure a LOCAL read -- which is the
-    // only in-run calibration available for the read byte count. Compare a
-    // crossing read against the local read from the same session rather than
-    // against a datasheet: the ratio is meaningful even if the absolute scale
-    // is not. It is also the control that showed crossing reads cost the
-    // writers 55% while local reads at twice the rate cost them 0%.
+    // Readers stay on their own die: same kernel, same accounting, nothing
+    // crosses. The read-side control, and the only in-run calibration of the
+    // read byte count.
     const unsigned int bg_r_local = env_u("NVHBI_BG_R_LOCAL", 0u);
     const unsigned int repeat    = env_u("NVHBI_REPEAT", 3u);
-    // How GPU1 pushes into GPU0:
-    //   0 = a kernel on GPU1 dereferencing GPU0 pointers (P2P load/store, SMs)
-    //   1 = cudaMemcpyPeerAsync (copy engines / DMA)
-    // Different hardware paths, so they need not interact with NV-HBI the same
-    // way. The kernel form is what showed zero interference with the
-    // background; whether DMA behaves the same is a separate question.
-    // CAVEAT for mode 1: a contiguous memcpy cannot be aimed at one die -- the
-    // dies interleave at 4KiB -- so it lands ~50/50 and the exp2/exp3 (far/near)
-    // distinction does not apply to it.
+    // Only the kernel path (P2P load/store) is supported: every stream is
+    // sampled from an in-kernel counter over one shared window, and a
+    // copy-engine path has no such counter.
     const unsigned int peer_mode = env_u("NVHBI_PEER_MODE", 0u);
     if (peer_mode != 0u) {
         fprintf(stderr, "ERROR: NVHBI_PEER_MODE=1 (cudaMemcpyPeerAsync) is not supported\n"
@@ -272,16 +223,13 @@ int main(int argc, char** argv) {
     auto die_list1 = [&](unsigned int die) { return (die == 1u) ? d_far1 : d_near1; };
     auto die_count = [&](unsigned int die) { return (die == 1u) ? t.far_count : t.near_count; };
 
-    /* =====================================================================
-       CALIBRATION 1: peer atomic latency to each die (attachment probe)
-
-       Times an ATOMIC on a small resident working set, repeated, after a warm-up
-       pass, and takes the minimum -- see nvhbi_peer_latency. The dies are probed
-       in ALTERNATING order across several rounds so that first-touch cost cannot
-       land on whichever die happens to go first. The earlier cold single-pass
-       version reported a 3.9x gap (13429 vs 3465 cycles) that was mostly
-       measurement order: an NV-HBI hop costs ~300 cycles, not ~10000.
-       ===================================================================== */
+    /* =============== CALIBRATION: which die is NVLink on? ===============
+       Times an ATOMIC -- it always travels to the home L2 slice, so no local
+       copy can serve it -- on a small resident working set, after a warm-up,
+       and takes the minimum. The dies are probed in ALTERNATING order across
+       rounds so first-touch cost cannot land on whichever goes first.
+       nvhbi_route_probe does the same with an SM on each die of BOTH GPUs,
+       which is the stronger check. ===================================== */
     unsigned int* d_lat2 = nullptr;
     CHECK_CUDA(cudaMalloc(&d_lat2, sizeof(unsigned int)));
 
@@ -363,11 +311,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    /* =====================================================================
-       CALIBRATION 2: uncontended peer WRITE bandwidth to each die
-       (with NV-HBI >> NVLink, both dies usually pin to ~NVLink BW, so this is
-        mainly a sanity number; latency is the real attachment discriminator.)
-       ===================================================================== */
+    /* -------- uncontended peer WRITE bandwidth to each die: a sanity number.
+       With NV-HBI >> NVLink both dies pin to ~NVLink, so the latency above is
+       the real attachment discriminator. -------- */
     auto peer_bw = [&](unsigned int die) -> double {
         CHECK_CUDA(cudaSetDevice(0));
         nvhbi_flush_l2(t);

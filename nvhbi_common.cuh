@@ -1,34 +1,35 @@
 // nvhbi_common.cuh -- shared machinery for the B200 NV-HBI (die-to-die) study.
 //
-// Used by:
-//   nvhbi_exp1_bisection.cu  -- exp 1: remote-L2 write bisection vs #SMs (ncu)
-//   nvhbi_exp23_peer.cu      -- exp 2/3: GPU1 -> GPU0 die1 / die0 over NVLink
-//   nvhbi_exp4_nccl.cu       -- exp 4: NCCL all-to-all under NV-HBI contention
+// Used by nvhbi_exp1_bisection, nvhbi_dualdir, nvhbi_exp23_peer and
+// nvhbi_route_probe.
 //
 // Model
 // -----
-// B200 is two dies joined by NV-HBI. Each die has its own L2 slice set, and the
+// B200 is two dies joined by NV-HBI. Each die has its own L2 slice set and the
 // address space is interleaved between them, so "which die owns this address"
-// is a property of the address, not of the allocation. We recover both maps by
-// latency probing (nvhbi_probe):
+// is a property of the address. nvhbi_probe() recovers both maps by latency
+// probing:
 //
 //   sm_side[smid]  even -> partition 0 (SM0's die), value/2 = rank in partition
 //                  odd  -> partition 1,             value/2 = rank in partition
-//   near_idx[]     4KiB chunk start offsets owned by partition 0
-//   far_idx[]      4KiB chunk start offsets owned by partition 1
+//   near_idx[]     4KiB chunk offsets owned by partition 0
+//   far_idx[]      4KiB chunk offsets owned by partition 1
 //
-// B200's L2 is write-no-allocate, so a store only *hits* if the line was
-// already pulled in by a load. Every experiment therefore warms the target
-// die's lines using that die's OWN SMs (nvhbi_warm_chunks) -- warming from the
-// far side would leave a local copy on the wrong die and hide fabric traffic.
+// B200's L2 is write-no-allocate, so a store only hits if the line was already
+// pulled in by a load. Targets are therefore warmed by the OWNING die's SMs
+// (nvhbi_warm) -- warming from the far side would leave a replica on the wrong
+// die and hide the fabric traffic.
 //
-// lines_mult
-// -----------
-// How many distinct 4KiB chunks each warp cycles through. Kept at 1 everywhere:
-// the footprint then fits in the target die's L2, so every store is a remote L2
-// hit and HBM stays out of the path. Larger values were explored as a "no L2
-// locality" regime and dropped -- how much of L2 is actually resident is not
-// something we can pin down, so it could not carry an argument.
+// Access shapes
+// -------------
+//   write  4B into each of 4 distinct 32B sectors per lane. A store ships one
+//          32B sector, so this is 32 sectors per instruction, the maximum.
+//   read   one 4B load per 128B line, lanes 128B apart. A 4B load drags the
+//          whole line across, so one instruction covers a 4KiB chunk.
+//
+// Every kernel keeps an in-kernel counter of the 32B sectors it moved; the host
+// samples it mid-flight and divides by wall time. All four programs report that
+// same statistic.
 
 #pragma once
 
@@ -50,10 +51,9 @@
     }                                                                          \
 } while (0)
 
-// How often the deadline loop stops to poll. Overridable so the cost of the
-// poll itself can be measured: -DNVHBI_POLL_MASK=65535u polls 64x less often.
-// exp1 (fixed-iteration branch, no poll at all) reaches 83.6 GB/s per SM where
-// this branch reaches 62.8, and the poll is the only difference in the loop.
+// How often a deadline loop stops to publish its counter and check for a stop.
+// The stop flag lives in device memory, so a poll costs an L2 hit; 1024
+// iterations still leaves ~50 samples inside a 200 ms window.
 #ifndef NVHBI_POLL_MASK
 #define NVHBI_POLL_MASK 1023u
 #endif
@@ -65,45 +65,28 @@
 #define NVHBI_PEER_POLL_MASK 63u
 #endif
 
-// Source tag, stamped into the top 4 bits of every value a writer stores.
-// 0 = off (the default, and what every bandwidth run should use). When set, the
-// stamp is folded into the initial value ONCE, before the loop, so the store
-// loop itself is byte-for-byte the same and the measurement is unperturbed --
-// the counter just keeps incrementing the low 28 bits underneath the tag, and
-// no run comes close to 2^28 iterations.
+// Source tag in the top 4 bits of every value a writer stores. 0 = off, which
+// is what bandwidth runs use. Folded into the initial value once, before the
+// loop, so the store loop is unchanged and the measurement is unperturbed.
 //
-// It exists to answer one question that no bandwidth number can: while two
-// sources write the SAME addresses concurrently, are both of them actually
-// landing there? Set it per device (the bg on GPU0, the peer on GPU1), run the
-// window, then count the tags over the shared range with nvhbi_count_tags.
+// It answers one question no bandwidth number can: when two sources write the
+// SAME addresses at once, is each of them really landing there? Set it per
+// device, run the window, then count tags with nvhbi_count_tags.
 __device__ unsigned int nvhbi_src_tag = 0u;
 
 /* ---------------------------------------------------------------- SM ticket
 
-   Which resident slot a block occupies on its SM. Both stress kernels used to
-   derive it as `blockIdx.x / sm_count`, which assumes block b lands on SM
-   b % sm_count. CUDA guarantees no such thing: if the scheduler fills SMs with
-   contiguous runs of blockIdx (GPC by GPC, which is what the hardware actually
-   tends to do), every one of the 32 blocks resident on an SM gets the SAME q,
-   and the per-warp `slot` collapses from 64 distinct values per SM to 2.
+   Which resident slot a block occupies on its SM, which is what fixes the chunk
+   each of its warps owns. Deriving it as blockIdx.x / sm_count would assume
+   block b lands on SM b % sm_count, and CUDA guarantees no such thing; where
+   that assumption fails, several warps are pointed at the SAME chunk and a
+   reader then counts L2 hits as fresh fetches.
 
-   For the WRITERS that is nearly invisible: 32 warps hammering one chunk issue
-   stores at the same rate as 32 warps on 32 chunks, and the counter -- which
-   counts issued stores -- reads the same. exp1's count_ratio stays 1.0000.
-
-   For the READERS it is fatal: the first warp pulls the line, the other 31 hit
-   it in L2, and every one of them is counted as a fresh 4096 B fetch. That is
-   why a LOCAL read measured 7318 GB/s against a per-die HBM ceiling of about
-   4.1 TB/s, why the crossing read read 4901, and why both curves were
-   non-monotonic in reader count -- the collision pattern moves with the block
-   distribution.
-
-   A per-SM ticket makes the slot correct whatever the scheduler does. It is
-   left free-running and taken modulo num_blocks_per_sm, so no host-side reset
-   is needed: exactly num_blocks_per_sm blocks take a ticket on each
-   participating SM per launch, so consecutive tickets mod that count are always
-   all-distinct, and the phase simply rotates between launches. Blocks that
-   return before this point never take one.                                  */
+   The ticket is free-running and taken modulo num_blocks_per_sm, so no host
+   reset is needed: each participating SM hands out exactly that many per
+   launch, so consecutive tickets mod that count are always all-distinct and the
+   phase just rotates between launches. Blocks that return earlier never take
+   one. nvhbi_route_probe PART B2 reports how far the old assumption was off. */
 #define NVHBI_MAX_SMS 256
 __device__ unsigned int nvhbi_sm_ticket[NVHBI_MAX_SMS];
 
@@ -131,8 +114,8 @@ __device__ __forceinline__ unsigned int nvhbi_smid() {
     return smid;
 }
 
-// L1-bypassing 4B store that the compiler may not remove, reorder away, or
-// merge across loop iterations.
+// L1-bypassing 4B store. asm volatile, so the compiler cannot remove it, merge
+// it across iterations, or CSE it.
 __device__ __forceinline__ void nvhbi_st(unsigned int* addr, unsigned int val) {
     asm volatile("st.global.cg.u32 [%0], %1;" :: "l"(addr), "r"(val));
 }
@@ -143,21 +126,12 @@ __device__ __forceinline__ unsigned int nvhbi_ld(const unsigned int* addr) {
     return v;
 }
 
-// Streaming load: allocates evict-first in L1 AND L2, so a read stream that
-// touches each line once stops displacing everything else. This is the only
-// eviction control expressible on the instruction itself -- the
-// .L1::evict_last / .L1::evict_first qualifiers are L1-only and cannot be
-// combined with a .cop like .cg, and L2 priority needs createpolicy plus
-// .L2::cache_hint.
-//
-// To PROTECT a working set in L2 (the other half of the problem) use the
-// runtime L2 residency control instead: cudaDeviceSetLimit with
-// cudaLimitPersistingL2CacheSize carves out a portion of L2 that normal and
-// streaming lines cannot occupy, and a cudaAccessPolicyWindow on the stream
-// marks one address range as persisting. That is a real reservation rather
-// than a replacement-order preference, so it survives a reader that turns the
-// whole L2 over every few tens of microseconds -- which per-instruction hints
-// demonstrably do not (see the .cs/.cv note in nvhbi_dualdir).
+// Streaming load: evict-first in L1 and L2, so a stream that touches each line
+// once stops displacing everything else. This is the only eviction control
+// expressible on the instruction itself. To PROTECT a working set instead, use
+// the runtime L2 residency control (cudaLimitPersistingL2CacheSize plus an
+// accessPolicyWindow), which is a real reservation rather than a replacement
+// preference -- see nvhbi_dualdir.
 __device__ __forceinline__ unsigned int nvhbi_ld_stream(const unsigned int* addr) {
     unsigned int v;
     asm volatile("ld.global.cs.u32 %0, [%1];" : "=r"(v) : "l"(addr));
@@ -174,14 +148,11 @@ __device__ __forceinline__ unsigned long long nvhbi_clock() {
 
 // Lane -> address mapping inside one 4KiB chunk.
 //
-//   lane = 0..31,  main = lane/4,  sub = lane%4
-//   byte offset of store k = 512*main + 128*k + 32*sub      (k = 0..3)
+//   byte offset of store k = 512*(lane/4) + 128*k + 32*(lane%4)   (k = 0..3)
 //
-// Lanes 4*main .. 4*main+3 cover the four 32B sectors of one 128B line, so each
-// store instruction of that quad coalesces into exactly one 128B line, and the
-// four stores walk four consecutive lines. A full warp covers the whole 4KiB
-// chunk at 32B sector granularity -- which matches the measured 32B granularity
-// of remote writes.
+// A lane quad covers the four 32B sectors of one 128B line, so each store
+// instruction coalesces into one line and the four stores walk four consecutive
+// lines. A full warp covers the whole chunk at sector granularity.
 __device__ __forceinline__ void nvhbi_lane_addrs(unsigned int* data,
                                                  unsigned int cidx,
                                                  unsigned int lane,
@@ -193,23 +164,10 @@ __device__ __forceinline__ void nvhbi_lane_addrs(unsigned int* data,
     out[3] = &data[base + 96u];
 }
 
-// One store group = 4 remote 32B sectors per lane, 4B written into each.
-//
-// SETTLED on B200 (exp1, 74 SMs, cross-die): a 4B store really does ship a whole
-// 32B sector across the fabric, so counting stores x 32B is sound. Two variants
-// were measured to establish that, then retired:
-//   16B per sector, same 4 instructions -> 2585 GB/s vs 2659 for 4B (within 3%)
-//   32B per sector, but 8 instructions  -> 1318 GB/s, exactly half
-// Bytes per sector do not move the sector rate; instruction count does. This
-// shape is therefore optimal for loading the fabric: 32 lanes each hitting a
-// distinct sector is 32 sectors per instruction, the hardware maximum.
-// One store group = 4 remote 32B sectors per lane: each lane writes 4B into
-// each of 4 sectors, and a lane quad covers the four sectors of one 128B line.
-// 32 sectors per instruction is the most one instruction can touch, and that is
-// what makes this the heaviest fabric load an SM can generate. A contiguous
-// 16B-per-lane variant was measured against it and was worse (2700 vs 3481
-// GB/s): the fabric is paid per sector, not per transaction, so trading sectors
-// per instruction for data density loses.
+// One store group: 4 remote 32B sectors per lane, 4B written into each. A 4B
+// store ships a whole 32B sector, so 32 lanes x 4 stores = 128 sectors per
+// group and 32 sectors per instruction -- the most one instruction can touch,
+// and therefore the heaviest fabric load an SM can generate.
 __device__ __forceinline__ void nvhbi_store_group(unsigned int* data,
                                                   unsigned int cidx,
                                                   unsigned int lane,
@@ -229,12 +187,10 @@ __global__ void nvhbi_find_sm_side(unsigned int* __restrict__ data,
     const unsigned int smid = nvhbi_smid();
     if (smid != (unsigned int)target_smid || threadIdx.x != 0) return;
     unsigned int consume = 0;
-    // MIN over the samples, not the last one. The classifier downstream splits
-    // on |lat[i] - lat[0]| < 100 cycles against a hop that measures ~360, so
-    // the window is wide -- but one noisy final sample used to be enough to
-    // flip an SM to the wrong die, and a misclassified SM then writes across
-    // the die boundary in exp1 while being counted as own-die (or vice versa),
-    // and shifts sms_p0/sms_p1 so the top of the SM sweep moves too.
+    // MIN over the samples: the classifier downstream splits on
+    // |lat[i] - lat[0]| < 100 cycles, and one noisy sample would flip an SM to
+    // the wrong die -- which then writes across the boundary while being
+    // counted as own-die.
     unsigned int best = ~0u;
 #pragma unroll 1
     for (int r = 0; r < 100; r++) {
@@ -299,20 +255,12 @@ __global__ void nvhbi_flush_kernel(unsigned int* __restrict__ buf, size_t n,
 // die. Each (chunk, lane) pair loads the same 4 lines the stress kernels store
 // to, which is exactly what write-no-allocate needs to turn stores into hits.
 //
-// Warps pull chunk ids from a shared cursor rather than deriving them from a
-// global warp index. That split is what makes the die filter above safe: with
-// `c = gwarp; c += gridDim*blockDim/32` every chunk belongs to exactly ONE
-// launched warp, and the ~half of those warps sitting on the other die return
-// at the line above without ever claiming theirs. Measured on a 148-SM B200
-// with a 72-SM target partition: 48.7% of the list loaded, i.e. exactly
-// 72/148 -- the coverage tracked the participating-SM fraction, which is the
-// signature of the bug and not of the (correct, deliberate) die filter. The
-// stress kernel meanwhile indexes with sm_rank = sm_side[smid]/2, a DENSE rank
-// inside the partition, so it writes [0,count) with no gaps. Half its stores
-// were therefore landing on lines nothing had pulled in, and under
-// write-no-allocate those go to HBM instead of the target die's L2.
-//
-// Callers go through nvhbi_warm(), which owns the cursor and zeroes it.
+// Warps pull chunk ids from a shared cursor rather than from a global warp
+// index. That is what makes the die filter safe: splitting by global warp index
+// gives each chunk to exactly one launched warp, and the warps sitting on the
+// other die return above without ever claiming theirs, so only the
+// participating-SM fraction of the list gets loaded. Callers go through
+// nvhbi_warm(); nvhbi_route_probe PART B measures the coverage both ways.
 __global__ void nvhbi_warm_chunks(unsigned int* __restrict__ data,
                                   const unsigned int* __restrict__ idx_list,
                                   unsigned int first,
@@ -343,23 +291,20 @@ __global__ void nvhbi_warm_chunks(unsigned int* __restrict__ data,
 
 /* ------------------------------------------------------- remote-write stress
 
-   Work mapping (dense, so the warmed chunk range is contiguous):
+   Each participating warp owns one chunk, assigned densely so the warmed range
+   is contiguous:
 
-     warps_per_block = ceil(block_size / 32)
-     plane_stride    = warps_per_block * num_blocks_per_sm * num_active_sm
-     chunk_id(j)     = chunk_offset
-                     + j * plane_stride                       (j = 0 .. L-1)
-                     + warp_in_block
-                     + warps_per_block * (q + num_blocks_per_sm * sm_rank)
+     slot = warp_in_block + warps_per_block * (q + num_blocks_per_sm * sm_rank)
 
-   so the whole kernel touches chunks [chunk_offset, chunk_offset + L*plane_stride).
+   with q from the per-SM ticket and sm_rank the SM's dense rank inside its
+   partition. Only SMs of `writer_partition` with sm_rank < num_active_sm run.
 
    Two termination modes:
-     iteration > 0        -> fixed trip count (exp 1, ncu-friendly: deterministic)
-     deadline_cycles > 0  -> run until the deadline or until *stop_flag != 0
-                             (background load for exp 2/3/4)
-   `progress` accumulates the number of 4B stores issued, which is what the host
-   turns into achieved sector bandwidth.                                      */
+     iteration > 0        fixed trip count      (exp1's slope pair)
+     deadline_cycles > 0  run until the deadline or *stop_flag  (every
+                          background load, and exp1's sampled point)
+
+   `progress` accumulates 32B sectors issued; the host turns it into bandwidth. */
 
 __global__ void nvhbi_stress_write(unsigned int* __restrict__ data,
                                    const unsigned int* __restrict__ far_idx,
@@ -384,13 +329,9 @@ __global__ void nvhbi_stress_write(unsigned int* __restrict__ data,
     const unsigned int sm_rank = sm_side[smid] / 2u;
     if (sm_rank >= num_active_sm) return;
 
-    // Cross-die (the measurement): partition-0 writers target die-1 memory,
-    // which is the "far from SM0" list, and vice versa.
-    // Own-die (target_own_die=1, the CONTROL): identical instruction stream,
-    // identical SM occupancy, identical store rate, but nothing crosses the
-    // fabric. Comparing the two separates fabric contention from SM/L2
-    // contention -- without it, "the collective slowed down" could just mean
-    // "something else was using the SMs".
+    // Cross-die: partition-0 writers target die-1 memory, and vice versa.
+    // target_own_die=1 is the control: same instruction stream, same occupancy,
+    // nothing crosses.
     const unsigned int* list = target_own_die
         ? ((writer_partition == 0u) ? near_idx : far_idx)
         : ((writer_partition == 0u) ? far_idx  : near_idx);
@@ -413,13 +354,10 @@ __global__ void nvhbi_stress_write(unsigned int* __restrict__ data,
     unsigned long long done = 0ull;
     const unsigned long long t0 = clock64();
 
-    // lines_mult is a runtime argument, so with the general inner loop the
-    // compiler must keep it and cannot hoist list[...] -- it reloads the index
-    // array and redoes the multiply every iteration, on top of a body that is
-    // only four stores. That cost ~18%: on one B200 this kernel measured 2949
-    // GB/s where the identical store stream with a hoisted index measured 3479.
-    // The L=1 case is the one every experiment actually uses, so give it a path
-    // where the chunk address is loaded once.
+    // lines_mult is a runtime argument, so the general inner loop reloads the
+    // index array every iteration -- ~18% on a body that is only four stores.
+    // L=1 is what every experiment uses, so it gets a path with the chunk
+    // address loaded once.
     const unsigned int cidx1 = list[chunk_offset + slot];
 
     if (deadline_cycles == 0ull) {
@@ -458,12 +396,10 @@ __global__ void nvhbi_stress_write(unsigned int* __restrict__ data,
             }
             done += 4ull * lines_mult;
             }
-            // Poll rarely. At every 64 iterations this block was the bottleneck:
-            // 4736 warps each reading a MAPPED HOST page over PCIe pinned the
-            // whole kernel to ~337 GB/s regardless of SM count (exp1 says 74 SMs
-            // should reach ~4750). stop_flag now lives in device memory and the
-            // interval is 1024 iterations, which still leaves ~50 progress
-            // samples per 200 ms window.
+            // Publish and check for a stop, rarely: the flag is in device
+            // memory (a mapped host page here cost PCIe reads and pinned the
+            // kernel to ~337 GB/s), and 1024 iterations still leaves ~50
+            // samples inside a 200 ms window.
             if ((it & NVHBI_POLL_MASK) == NVHBI_POLL_MASK) {
                 if (progress && lane == 0u) { atomicAdd(progress, done * lanes); done = 0ull; }
                 if ((unsigned long long)(clock64() - t0) > deadline_cycles) break;
@@ -473,19 +409,11 @@ __global__ void nvhbi_stress_write(unsigned int* __restrict__ data,
     }
 
     if (progress && lane == 0u && done) atomicAdd(progress, done * lanes);
-    // Longest loop span over all participating warps, which tracks the kernel's
-    // own busy time. A single designated thread did NOT: it reported 0.50-1.49
-    // GHz on a GPU nvidia-smi held pinned at 1.965 GHz, and the figure halved
-    // when block_size doubled, because that one thread stops representing the
-    // kernel as soon as occupancy changes. Callers must zero *cycles_out first.
-    //
-    // The SHORTEST span alongside it measures how unevenly the fabric shared
-    // itself out. It exists to explain a 17% disagreement between this program's
-    // two harnesses: a fixed-iteration run is timed by its SLOWEST warp, while a
-    // deadline run sampled mid-flight sees the aggregate rate with every warp
-    // still active. If min/max is ~1 the two must agree; the more it falls below
-    // 1, the more the fixed-iteration number is dragged down by a tail of warps
-    // finishing alone. Callers must set *cycles_min_out to all-ones first.
+    // Longest and shortest loop span over the participating warps. The longest
+    // gives the achieved SM clock; their ratio (span_ratio) says how evenly the
+    // fabric shared itself out, which is why a fixed-iteration run -- timed by
+    // its slowest warp -- can read below a mid-flight sampled run of the same
+    // kernel. Callers must zero *cycles_out and set *cycles_min_out to all-ones.
     if (cycles_out && lane == 0u)
         atomicMax(cycles_out, (unsigned long long)(clock64() - t0));
     if (cycles_min_out && lane == 0u)
@@ -622,16 +550,9 @@ __global__ void nvhbi_dual(unsigned int* __restrict__ data,
    copy (on the running GPU) of the target GPU's chunk offsets for one die, so
    every byte written lands on the die we chose.                              */
 
-// Injection rate is controlled by the grid size (how many warps inject), and
-// every point runs for a fixed wall time via deadline_cycles, so a sweep over
-// grid sizes gives evenly-timed samples along the NVLink-load axis.
-//
-// idle_cycles: a spin after each store group, so the duty cycle is roughly
-// work/(work+idle) and injection is continuously tunable. Added because the
-// first sweep used peer_blocks 16..1024 and every point read 634-645 GB/s -- the
-// smallest grid already saturated NVLink, so the whole x axis sat past
-// saturation and four points were plotted where there was really only one.
-// Grid size alone quantises the load to whole warps and cannot go below that.
+// Injection rate comes from the grid size and the block size; idle_cycles adds
+// a spin after each store group so the duty cycle, and hence the offered load,
+// is continuously tunable below one warp's worth.
 __device__ __forceinline__ void nvhbi_spin(unsigned long long cycles) {
     if (!cycles) return;
     const unsigned long long s = clock64();
@@ -647,12 +568,9 @@ __global__ void nvhbi_peer_write(unsigned int* __restrict__ peer_data,
                                  unsigned int idle_cycles,
                                  unsigned long long* __restrict__ progress,
                                  unsigned int* __restrict__ sink) {
-    // Warp id from (block, warp-in-block), NOT from the flat thread id. The two
-    // agree whenever blockDim is a multiple of 32, and only the former survives
-    // a SUB-WARP block size: with blockDim=1 the flat form gives every block in
-    // a group of 32 the same gwarp and an nwarps of gridDim/32, so all of them
-    // walk the identical chunk sequence -- 32 writers piled on one sector at a
-    // time, and an nwarps of 0 (hence an infinite inner loop) for small grids.
+    // Warp id from (block, warp-in-block), not from the flat thread id: only
+    // this form survives a SUB-WARP block size, where the flat one would give
+    // whole groups of blocks the same id and an nwarps of 0.
     const unsigned int wpb    = (blockDim.x + 31u) / 32u;
     const unsigned int wib    = threadIdx.x / 32u;
     const unsigned int lane   = threadIdx.x % 32u;
@@ -701,14 +619,10 @@ __global__ void nvhbi_peer_write(unsigned int* __restrict__ peer_data,
 
 /* --------------------------------------------------- who wrote it last?
 
-   Reads back exactly the words nvhbi_store_group writes and histograms them by
-   source tag, so a run where two writers share a range can be checked for the
-   thing a bandwidth number cannot show: that both of them are really landing on
-   those bytes at the same time. A tag that never appears means that writer is
-   not reaching this range at all, whatever its counter says it issued.
-
-   .cv on the loads: a local replica must not be allowed to answer for the home
-   copy, or the count would describe this die's cache rather than memory.      */
+   Reads back the words nvhbi_store_group writes and histograms them by source
+   tag, so a range shared by two writers can be checked for what a bandwidth
+   number cannot show: that both are really landing on those bytes. .cv on the
+   loads, so no local replica answers for the home copy. */
 __global__ void nvhbi_count_tags(const unsigned int* __restrict__ data,
                                  const unsigned int* __restrict__ idx_list,
                                  unsigned int first, unsigned int count,
@@ -1126,11 +1040,10 @@ static inline double nvhbi_footprint_mb(unsigned int num_active_sm,
 }
 
 /* -------- stop flag, in DEVICE memory --------
-   It used to be mapped host memory, which meant every polling warp issued a
-   PCIe read; that alone capped nvhbi_stress_write at ~337 GB/s. Device memory
-   costs an L2 hit instead, and the host sets it with a 4-byte H2D copy (safe to
-   issue while the kernel runs, since the stress kernel is on a non-blocking
-   stream).                                                                   */
+   Mapped host memory would make every polling warp issue a PCIe read; device
+   memory costs an L2 hit instead. The host sets it with a 4-byte H2D copy while
+   the kernel runs, which is safe because the kernel is on a non-blocking
+   stream. */
 
 struct NvhbiStopFlag {
     unsigned int* d = nullptr;

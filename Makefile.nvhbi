@@ -1,67 +1,26 @@
-# Makefile.nvhbi -- builds the NV-HBI bisection study binaries.
-#   make -f Makefile.nvhbi            # exp1 + exp2/3
-#   make -f Makefile.nvhbi nccl       # exp4 (needs NCCL headers/libs)
-#   make -f Makefile.nvhbi ARCH=100   # sm_100 = Blackwell (default)
+# Makefile.nvhbi -- B200 NV-HBI (die-to-die) bandwidth study.
+#
+#   make -f Makefile.nvhbi              # the three experiment binaries
+#   make -f Makefile.nvhbi probes       # the topology / routing checker
+#   make -f Makefile.nvhbi ARCH=100     # sm_100 = Blackwell (default)
 
-NVCC ?= nvcc
-ARCH ?= 100
+NVCC  ?= nvcc
+ARCH  ?= 100
 
-EXTRA_FLAGS ?=
-NVCCFLAGS ?= $(EXTRA_FLAGS) -O3 -std=c++14 \
+NVCCFLAGS ?= -O3 -std=c++14 \
              -Xptxas -dlcm=ca -Xptxas -dscm=cg \
              -gencode arch=compute_$(ARCH),code=sm_$(ARCH)
 
-# Set NCCL_HOME if NCCL is not on the default include/library path. The layout
-# expected is $(NCCL_HOME)/include/nccl.h and $(NCCL_HOME)/lib/libnccl.so*.
-#
-# Two things that made this fail in practice and are handled here:
-#  * pip-installed NCCL (the nvidia-nccl-cu12 wheel, which is what a PyTorch
-#    image usually has) ships libnccl.so.2 with NO unversioned libnccl.so
-#    symlink, so plain -lnccl finds nothing. NCCL_SO below links the versioned
-#    file directly when that is all there is.
-#  * a non-standard NCCL_HOME needs an rpath, or the binary builds and then dies
-#    at startup with "libnccl.so.2: cannot open shared object file".
-NCCL_HOME ?=
-NCCL_INC  := $(if $(NCCL_HOME),-I$(NCCL_HOME)/include,)
-NCCL_SO   := $(firstword $(wildcard $(NCCL_HOME)/lib/libnccl.so) \
-                         $(wildcard $(NCCL_HOME)/lib/libnccl.so.2))
-NCCL_LIB  := $(if $(NCCL_SO),$(NCCL_SO),$(if $(NCCL_HOME),-L$(NCCL_HOME)/lib,) -lnccl)
-NCCL_RPATH := $(if $(NCCL_HOME),-Xlinker -rpath -Xlinker $(NCCL_HOME)/lib,)
+BINS   := nvhbi_exp1_bisection nvhbi_dualdir nvhbi_exp23_peer
+PROBES := nvhbi_route_probe
 
-BINS      := nvhbi_exp1_bisection nvhbi_exp23_peer nvhbi_dualdir nvhbi_peerl2
-PROBES    := nvhbi_route_probe
-NCCL_BIN  := nvhbi_exp4_nccl
-
-.PHONY: all nccl clean nccl-probe probes
+.PHONY: all probes clean
 
 all: $(BINS)
 probes: $(PROBES)
-nccl: $(NCCL_BIN)
 
 $(BINS) $(PROBES): %: %.cu nvhbi_common.cuh
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
-nvhbi_validate_counter: nvhbi_validate_counter.cu nvhbi_common.cuh
-	$(NVCC) $(NVCCFLAGS) -o $@ $<
-
-$(NCCL_BIN): $(NCCL_BIN).cu nvhbi_common.cuh
-	$(NVCC) $(NVCCFLAGS) $(NCCL_INC) -o $@ $< $(NCCL_LIB) $(NCCL_RPATH)
-
-# Print what the NCCL build would use, without building. Run this first when
-# exp4 fails to link -- it says which of header/lib is actually missing.
-NCCL_H_FOUND := $(firstword $(wildcard $(NCCL_HOME)/include/nccl.h) \
-                            $(wildcard /usr/include/nccl.h) \
-                            $(wildcard /usr/local/include/nccl.h) \
-                            $(wildcard /usr/local/cuda/include/nccl.h) NOT-FOUND)
-NCCL_L_FOUND := $(firstword $(NCCL_SO) \
-                            $(wildcard /usr/lib/x86_64-linux-gnu/libnccl.so*) \
-                            $(wildcard /usr/local/cuda/lib64/libnccl.so*) NOT-FOUND)
-
-nccl-probe:
-	@echo "NCCL_HOME  = $(if $(NCCL_HOME),$(NCCL_HOME),<unset>)"
-	@echo "header     = $(NCCL_H_FOUND)"
-	@echo "library    = $(NCCL_L_FOUND)"
-	@echo "link flags = $(NCCL_INC) $(NCCL_LIB) $(NCCL_RPATH)"
-
 clean:
-	rm -f $(BINS) $(PROBES) $(NCCL_BIN) nvhbi_validate_counter
+	rm -f $(BINS) $(PROBES)

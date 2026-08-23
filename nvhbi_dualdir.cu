@@ -1,69 +1,40 @@
-// nvhbi_dualdir.cu -- drive ONE fabric direction with two payload sources.
+// nvhbi_dualdir.cu -- ONE fabric direction, TWO payload sources.
 //
-//     die A SMs  write into die B L2   -> payload travels A -> B
-//     die B SMs  read  from die A HBM  -> request B->A (small),
-//                                         PAYLOAD returns A -> B
+//     die A SMs  write into die B L2    -> payload travels A -> B
+//     die B SMs  read  from die A HBM   -> request B->A (small),
+//                                          PAYLOAD returns A -> B
 //
 // Both payloads move A->B and are issued by different SMs on different dies, so
-// neither source's own issue rate caps the total.
+// neither source's own issue rate caps the total. This is how the direction is
+// driven harder than one die's stores alone can drive it.
 //
-// WHAT IT MEASURED (B200, one session, buf_mult=64)
-//     write alone, 70 SMs            2320 GB/s
-//     read  alone, 76 SMs            1887
-//     both  together            1063 + 1075 = 2138
+// NVHBI_R_LOCAL=1 is the validity control: the readers pull from their OWN die,
+// so they load that die's L2 and HBM just as hard but cross nothing. If the
+// writers slow down under crossing reads and not under local reads, the two
+// payloads are meeting at the die boundary and nowhere else.
 //
-// The combination is WORSE than writes alone, and the link splits almost
-// exactly 50/50 between the two sources with under 0.1% run-to-run spread. So
-// writes on their own already saturate this direction; reads do not add
-// headroom, they take a share and cost about 8% in mixing. The hypothesis this
-// program was written to test -- that the scattered store pattern was leaving
-// fabric capacity unused -- is refuted. Other sessions put write-alone at
-// 3.4-3.5 TB/s; the instance-to-instance spread is about 1.5x, so only compare
-// numbers from one run.
+// Reads must stream over a footprint far larger than L2. A remote read leaves a
+// read-only replica on the reading die, so a chunk touched twice is served
+// locally and never crosses again -- hence NVHBI_BUF_MULT defaults to 64.
 //
-// Design points that were settled by measurement, and why they look like this:
+// Reads use a 128B stride, one 4B load per line, one instruction per 4KiB
+// chunk: a 4B load drags the whole 128B line across, so this covers the chunk
+// without wasting lanes. Writes use the 4-sector store group, because a store
+// ships one 32B sector.
 //
-//  * ONE kernel, not two. As separate launches each asked for a full 148x32
-//    grid, oversubscribing the GPU 2x, so they fought over SM slots instead of
-//    the link: the write counter read exactly 0.00 on the first repeat of every
-//    point. One grid gives every SM its blocks and leaves the fabric as the
-//    only shared resource.
+// Both counters are sampled mid-flight over one host window, the same statistic
+// nvhbi_exp1_bisection's sampled_GBps and nvhbi_exp23_peer report.
 //
-//  * Reads use a 128B stride, one 4B load per line, ONE instruction per 4KiB
-//    chunk. A contiguous 16B/lane version that reads all 4096 B explicitly was
-//    measured alongside it: 1909 vs 1826 GB/s, i.e. the same, with 8x the
-//    instructions. Equality also settles the granularity question -- if a 4B
-//    load pulled only a 32B sector, the strided count would have overstated
-//    traffic 4x and read ~4x higher. It does not, so a 4B remote load really
-//    drags a whole 128B line across.
-//
-//  * Reads must STREAM over a footprint far larger than L2. A remote read
-//    leaves a replica on the reading die, so a chunk touched twice is served
-//    locally and never crosses again. Read bandwidth fell 5960 -> 4820 -> 2390
-//    -> 1920 GB/s as the sweep grew 0.5 -> 1 -> 2 -> 4 GB; only the last is
-//    fabric traffic. Hence buf_mult defaults to 64.
-//
-//  * ld.global.cg. The .cs (evict-first) and .cv (re-fetch) variants were tried:
-//    .cs moved read from 1076 to 1129 GB/s and left write unchanged, .cv the
-//    same. Cache hints cannot protect the writers' working set when reads churn
-//    the whole L2 every ~33 us.
-//
-//  * NVHBI_R_LOCAL=1 keeps the readers on their own die. It is the validity
-//    control: it fills die B's L2 just as hard but crosses nothing, and it
-//    separates the two ways reads hurt writes -- local reads cost writes 16%
-//    (eviction), crossing reads cost 54% (eviction plus fabric).
-//
-// argv: [writer_partition]  0|1   (die A = writing die; readers sit on die B)
+// argv: [writer_partition]  0|1   (die A = the writing die; readers sit on B)
 //
 // Env: NVHBI_W_SMS      writer SM counts, 0=off.  default "0,70"
 //      NVHBI_R_SMS      reader SM counts, 0=off.  default "0,8,16,32,64,78"
-//      NVHBI_R_CHUNKS   read sweep in 4KiB chunks, 0 = whole source die (default)
-//      NVHBI_R_LOCAL    1 = readers read their OWN die (crosses nothing), default 0
-//      NVHBI_W_WARM     0 = skip the write-target warm-up entirely, default 1
-//      NVHBI_R_EVICT    1 = ld.global.cs on the reads (evict-first), default 1
-//      NVHBI_L2_PERSIST 1 = reserve L2 for the write set via
-//                       cudaLimitPersistingL2CacheSize + accessPolicyWindow,
-//                       default 1
+//                       (values above a die's SM count are clamped)
+//      NVHBI_R_CHUNKS   read sweep in 4KiB chunks, 0 = the whole source die
+//      NVHBI_R_LOCAL    1 = readers read their OWN die. default 0
+//      NVHBI_W_WARM     0 = skip warming the write targets. default 1
+//      NVHBI_R_EVICT    1 = ld.global.cs on reads (evict-first). default 1
+//      NVHBI_L2_PERSIST 1 = reserve L2 for the write set. default 1
 //      NVHBI_BUF_MULT   allocation as a multiple of L2, default 64 (~4 GB/die)
 //      NVHBI_WINDOW_MS  default 200      NVHBI_REPEAT default 3
 //      NVHBI_BLOCK / NVHBI_BLOCKS_PER_SM   default 64 / 32

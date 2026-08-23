@@ -1,63 +1,49 @@
 // nvhbi_exp1_bisection.cu -- EXPERIMENT 1
 //
-// NV-HBI (die-to-die) write bisection bandwidth of a single B200, swept over the
-// number of writing SMs.
+// Cross-die write bandwidth of a single B200, swept over the number of writing
+// SMs.
 //
-// SMs of one die issue only stores into the other die's L2 lines, which that
-// die's own SMs warmed first (B200 L2 is write-no-allocate, so a store only hits
-// on a resident line). No loads, so all traffic crosses the fabric in one
+// SMs on one die issue only stores into the other die's L2 lines, which that
+// die's own SMs warmed first (B200's L2 is write-no-allocate, so a store only
+// hits on a resident line). No loads, so all traffic crosses NV-HBI in one
 // direction. Each lane writes 4B into each of 4 distinct 32B sectors, giving 32
 // sectors per store instruction -- the hardware maximum, hence the heaviest
 // fabric load an SM can generate.
 //
-// TWO-POINT SLOPE TIMING
-// ----------------------
-// Each configuration runs twice, at ITER_LO and ITER_HI, and the bandwidth is
+// own_die is the control: the same instruction stream and occupancy with the
+// target on the writer's own die, so nothing crosses. Where the two curves
+// separate is where the crossing itself, and not the SMs or the L2, is the
+// limit.
 //
-//     BW = (bytes_hi - bytes_lo) / (t_hi - t_lo)
+// TWO NUMBERS PER ROW, and they measure different things
+// ------------------------------------------------------
+//   slope_GBps    Two runs at ITER_LO and ITER_HI, then
+//                     BW = (bytes_hi - bytes_lo) / (t_hi - t_lo),
+//                 so launch, ramp-up, the cold miss and the tail all cancel.
+//                 The denominator is still when the SLOWEST warp finished, so
+//                 under an unfair fabric this reports the slowest warp's rate.
 //
-// so everything that does not scale with the loop count cancels: launch, grid
-// ramp-up and drain, the cold miss on sm_side, the first index-array load, the
-// tail. This matters enormously -- at iteration=100 the fixed cost was ~1.5 ms
-// and dominated everything, with kernel time rising only 1.45x while the work
-// rose 74x and two SM steps where MORE work finished FASTER. `naive_GBps` is
-// still reported so the size of that effect stays visible; `overhead_ms` is the
-// fixed cost the two points imply and should come out near zero.
-//
-// own_die: THE CONTROL, AND A RESULT
-// ----------------------------------
-// Repeating the sweep with stores kept on the writer's own die gives the same
-// instruction stream and occupancy with nothing crossing the fabric. Measured:
-//
-//     <= 32 SMs   cross == own to 4 significant figures (83.8 GB/s per SM)
-//        64 SMs   own / cross = 1.18
-//        77 SMs   own / cross = 1.33   (cross 64% of linear, own 86%)
-//
-// Below 32 SMs each SM is limited by its own store issue rate and crossing the
-// die boundary is free. Above that only the cross-die curve flattens, which is
-// what makes the plateau a property of the fabric rather than of the SMs or L2.
-// Plateau: ~4.4-4.8 TB/s (4753 +/- 4% over three sessions at 74 SMs).
+//   sampled_GBps  The same kernel run to a deadline, with the host reading the
+//                 in-kernel store counter at two instants and dividing by wall
+//                 time. This is the MEAN rate while every warp is still
+//                 running, and it is the number that is comparable with
+//                 nvhbi_dualdir and nvhbi_exp23_peer -- all three use it.
 //
 // eff_GHz is the SM clock actually achieved, from in-kernel cycles over wall
-// time. Bandwidth is only comparable between rows at the same eff_GHz --
-// identical work once measured 1.56x apart across sessions before this was
-// tracked. It comes from one designated thread, so it also picks up load
-// imbalance; compare it between rows of equal SM count, not across SM counts.
+// time. Only compare bandwidths between rows at the same eff_GHz.
 //
-// The store-shape question ("does a 4B store really ship a whole 32B sector?")
-// was settled and the diagnostic modes retired -- see nvhbi_store_group.
-//
-// Env knobs:
+// Env:
 //   NVHBI_BLOCK_SIZES   default "32,64" (block_size/32 = warps per SM slot)
-//   NVHBI_SMS           SM-count list, default "" = powers of two up to the max
+//   NVHBI_SMS           SM-count list; "" = powers of two up to the max.
+//                       Values above the die's SM count are clamped, so 999
+//                       means "all of them".
 //   NVHBI_OWN_DIE       "0" cross-die, "1" own-die, "0,1" both. default "0,1"
-//   NVHBI_ITER_LO       default 2000
-//   NVHBI_ITER_HI       default 6000
+//   NVHBI_ITER_LO / _HI slope points, default 2000 / 6000
+//   NVHBI_SAMPLE_MS     sampled window, 0 = off.  default 200
+//   NVHBI_SAMPLE_SETTLE_MS  settle before sampling, default 100
 //   NVHBI_BLOCKS_PER_SM default 32
-//   NVHBI_BUF_MULT      default 8
-//   NVHBI_SAMPLE_MS     sampled-rate window in ms, 0 = off. default 200
-//   NVHBI_SAMPLE_SETTLE_MS  settle before sampling,        default 100
-//   NVHBI_LAT_THRESHOLD probe threshold in cycles, default 500
+//   NVHBI_BUF_MULT      allocation as a multiple of L2, default 8
+//   NVHBI_LAT_THRESHOLD die-probe threshold in cycles, default 500
 //
 // argv: [writer_partition]   0 | 1 | 2(=both, default)
 
@@ -130,18 +116,14 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaEventCreate(&e1));
     unsigned long long* d_cycles = nullptr;
     CHECK_CUDA(cudaMalloc(&d_cycles, sizeof(unsigned long long)));
-    // exp1 derives bytes analytically (nsm x nbps x block_size x 4 x iteration)
-    // while exp2/3 count the stores the kernel really issued. The two agree
-    // exactly in the linear region but diverge ~20% once the fabric saturates,
-    // so count here too and publish the ratio rather than assume.
+    // Bytes are derived analytically (nsm x nbps x block_size x 4 x iteration)
+    // and counted in-kernel as well; count_ratio publishes the agreement rather
+    // than assuming it.
     unsigned long long* d_prog = nullptr;
     CHECK_CUDA(cudaMalloc(&d_prog, sizeof(unsigned long long)));
-    // Shortest warp span, to sit next to the longest one in d_cycles. Their ratio
-    // is how evenly the fabric shared itself out, and it is the explanation for
-    // this program reading 17% below exp2/dualdir at saturation while agreeing
-    // with them to 0.3% below it: a fixed-iteration kernel is timed by its
-    // SLOWEST warp, so a spread-out tail drags the whole number down. Compare
-    // span_ratio against exp1_GBps / exp2_GBps at the same point.
+    // Shortest warp span next to the longest one. span_ratio = min/max says how
+    // evenly the fabric shared itself out, which is why the slope number (timed
+    // by the slowest warp) can read below the sampled one.
     unsigned long long* d_cyc_min = nullptr;
     CHECK_CUDA(cudaMalloc(&d_cyc_min, sizeof(unsigned long long)));
     // The sampled harness needs the kernel to stay resident while the host reads
@@ -167,9 +149,7 @@ int main(int argc, char** argv) {
         unsigned int sm_list[32];
         int sm_n = 0;
         if (sm_env_n > 0) {
-            // Clamp, do not drop. NVHBI_SMS=999 used to silently produce an
-            // empty sweep here while exp23 clamped the same value, so "999 means
-            // max" held in one program and not the other.
+            // Clamp, do not drop, so NVHBI_SMS=999 means "all of them".
             for (int i = 0; i < sm_env_n; ++i) {
                 if (sm_env[i] == 0u) continue;
                 unsigned int v = (sm_env[i] > max_sms) ? max_sms : sm_env[i];
@@ -232,22 +212,14 @@ int main(int argc, char** argv) {
                                       cudaMemcpyDeviceToHost));
             }
 
-            /* ---- SAMPLED RATE: exp2/exp3's statistic, on exp1's configuration ----
-               The slope pair above times the kernel with cudaEvents, so its
-               denominator is when the LAST warp finished. Under a saturated
-               fabric the arbitration is not fair, and a warp that is served 20%
-               below the mean stays 20% behind for the whole run -- its deficit
-               grows with the iteration count, so the two-point slope cannot
-               cancel it the way it cancels launch and drain. That is why this
-               program reads ~3.0 TB/s at 74 SMs where exp2's background reads
-               ~3.4 TB/s on the identical kernel, and why the two agree to 0.2%
-               below saturation, where there is no spread to be timed by.
-               `slope_GBps` therefore reports the SLOWEST warp's rate; exp2
-               reports the MEAN rate while every warp is still running.
-               Neither is wrong, but only one of them can be compared to exp2,
-               so measure it here too: run the same kernel to a deadline and
-               divide the counter delta by wall time, exactly as exp2 does.
-               sampled_GBps should match exp2's bg_GBps at the same SM count. */
+            /* ---- SAMPLED RATE: the statistic the other programs report ----
+               The slope pair above is timed with cudaEvents, so its denominator
+               is when the LAST warp finished; under an unfair fabric a warp
+               served below the mean stays behind for the whole run and its
+               deficit grows with the iteration count, which no two-point slope
+               can cancel. So measure the mean rate too: run the same kernel to
+               a deadline and divide the counter delta by wall time, exactly as
+               nvhbi_dualdir and nvhbi_exp23_peer do. */
             double sampled_gbps = 0.0, samp_ms = 0.0;
             if (sample_ms) {
                 nvhbi_flush_l2(t);

@@ -1,60 +1,42 @@
-// nvhbi_route_probe.cu -- where does a peer write actually land?
+// nvhbi_route_probe.cu -- validity checks for EXPERIMENTS 2 and 3.
 //
-// EXPERIMENT 2 assumes: GPU1 --NVLink--> GPU0's NVLink die --NV-HBI--> the far
-// die's L2. Everything exp2 concludes rests on that chain, and exp2 cannot test
-// it, because the only thing it observes is a bandwidth number that comes out
-// the same under every hypothesis. (It has to: NV-HBI is 10 TB/s BIDIRECTIONAL,
-// so ~5 TB/s per direction, while one die's 74 SMs cannot push past ~4.0 TB/s
-// even writing to their OWN die -- exp1's own_die control. The link is never
-// close to full, so 630 GB/s of peer traffic displaces nothing whether or not
-// it shares the link.)
+// exp2/exp3 rest on a chain that neither of them can test: GPU1 --NVLink--> the
+// NVLink-attached die of GPU0 --NV-HBI--> the far die's L2. A bandwidth number
+// comes out the same whether or not that chain holds, so check it directly.
 //
-// So test the chain directly, one link at a time, with instruments that give a
-// yes/no rather than a number to squint at.
+//   PART B   Warm-up coverage. nvhbi_warm_chunks is handed a chunk list and has
+//            to load all of it. Reported as a percentage against the old
+//            indexing, which split the list by GLOBAL warp index and therefore
+//            dropped every chunk whose warp had landed on the other die.
 //
-//   PART B  warm-up coverage. Does nvhbi_warm_chunks actually load all `count`
-//           chunks it is handed? It filters SMs by die (correct) but splits the
-//           work by GLOBAL warp index (not), so every chunk whose warp landed
-//           on the other die is skipped. Printed as a percentage against a
-//           work-queue version that cannot miss. Everything downstream depends
-//           on the target lines really being resident, so this goes first.
+//   PART B2  Does block b really land on SM (b % sm_count)? The stress kernels
+//            used to assume it when deriving a block's slot on its SM; they now
+//            take a per-SM ticket instead. This reports how badly the old
+//            assumption would have collided.
 //
-//   PART C  attachment. Atomic latency, GPU0-internal (the ~300 cycle NV-HBI
-//           hop, re-measured here so the comparison is within one run) and
-//           GPU1->GPU0, taken from an SM on EACH die of BOTH GPUs. The full
-//           2x2x2 is the point: if NVLink lands on one die of each GPU, the
-//           table must be ADDITIVE -- one ~300 cycle step along the GPU0 axis
-//           and one along the GPU1 axis. A single gap could be many things; two
-//           independent gaps of the same size as the internal hop is a
-//           signature. (The old calibration used smid 0 and 147 and got only
-//           -71/-135 on the GPU1 axis, which says those two SMs were probably
-//           on the same GPU1 die -- that axis was never actually measured.)
+//   PART C   Attachment. Atomic latency inside GPU0 (one NV-HBI hop, the
+//            yardstick) and from GPU1, taken from an SM on EACH die of BOTH
+//            GPUs. If NVLink is die-attached on both, the 2x2 must be ADDITIVE:
+//            one hop-sized step along each axis. One gap could be many things;
+//            two independent gaps that add is a signature.
 //
-//   PART D  THE POINT. GPU1 stamps a deterministic, address-derived pattern
-//           into the far die's chunks. Then GPU0:
-//             (1) reads it back and counts mismatches
-//                 -> proves the bytes reached those addresses at all, and that
-//                    the die map GPU1 was given is the right one.
-//             (2) times a FIRST-TOUCH read of those lines, from an SM on the
-//                 home die and from an SM on the other die, against a ladder
-//                 measured with the identical instrument in the same run:
-//                      cold (flushed, no warm)      -> the HBM reference
-//                      warm                          -> the L2 reference
-//                      warm + a GPU0 local store     -> L2, known dirty
-//                      warm + the GPU1 peer store    -> the unknown
-//                 Calibration from earlier work: local L2 read 260-300 cyc,
-//                 local HBM read 560-620 cyc. If "warm + peer store" sits at
-//                 the L2 reference the peer write landed in the home die's L2;
-//                 if it sits at the HBM reference the peer write pushed the
-//                 line out to memory and exp2 has not been measuring remote-L2
-//                 writes at all.
+//   PART D   Where a peer write lands. GPU1 stamps an address-derived pattern
+//            into the far die's chunks; GPU0 reads it back (mismatches = 0
+//            proves the bytes reached those addresses) and times a FIRST-TOUCH
+//            read against a ladder measured in the same run:
+//               cold (flushed)  -> the HBM reference
+//               warm            -> the L2 reference
+//               warm + a GPU0 local store
+//               warm + the GPU1 peer store   <- the unknown
+//            Reference from earlier work: local L2 read 260-300 cyc, local HBM
+//            read 560-620 cyc.
 //
-//   PART E  optional (NVHBI_RP_PART_E=1): peer latency while GPU0 holds a
-//           background load, in three modes that separate the link from the
-//           far die's L2. Only meaningful once PART C has named the attach
-//           die, so it refuses to run if PART C was inconclusive.
+//   PART E   Optional (NVHBI_RP_PART_E=1): peer latency while GPU0 holds a
+//            background load, in three modes that separate the link from the
+//            far die's L2. Latency responds well below saturation, where
+//            bandwidth does not.
 //
-// Reads nothing and writes nothing that the experiment programs use.
+// Writes nothing the experiment programs read.
 //
 // Env:
 //   NVHBI_RP_CHUNKS      chunks per measurement region,   default 256
@@ -65,7 +47,7 @@
 //   NVHBI_RP_TRIALS      repeats of the PART D ladder,    default 5
 //   NVHBI_RP_PART_E      1 = also run the contention part, default 0
 //   NVHBI_RP_BG_SMS      PART E background SM counts,     default "0,32,64,74"
-//   NVHBI_RP_BG_BLOCK / NVHBI_RP_BG_BLOCKS_PER_SM         default 64 / 32
+//   NVHBI_RP_BG_BLOCK / NVHBI_RP_BG_BLOCKS_PER_SM         default 64 / 31
 //   NVHBI_RP_SETTLE_MS   settle after a bg launch,        default 100
 //   NVHBI_FAR_DIE        override the near/far decision (0 or 1)
 //   NVHBI_BUF_MULT       default 8
