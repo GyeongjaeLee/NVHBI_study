@@ -784,12 +784,18 @@ int main(int argc, char** argv) {
             const float peer_ms = (float)win_ms;
 
             unsigned long long bg_cyc = 0ull;
+            double bg_span_ms = 0.0;
             if (bg_on) {
                 nvhbi_stop_flag_set(stop);
                 CHECK_CUDA(cudaSetDevice(0));
                 CHECK_CUDA(cudaStreamSynchronize(s_bg));
                 CHECK_CUDA(cudaMemcpy(&bg_cyc, d_bg_cyc, sizeof(bg_cyc),
                                       cudaMemcpyDeviceToHost));
+                // Stamp the span HERE, before waiting out the peer's drain. Taking
+                // it afterwards charged the background with the peer's margin and
+                // reported 1.64 GHz on a GPU pinned at 1.96 -- a pure artifact
+                // that looked exactly like throttling under peer load.
+                bg_span_ms = now_ms() - bg_launch_ms;
             }
             if (peer_running) {
                 CHECK_CUDA(cudaSetDevice(1));
@@ -802,7 +808,6 @@ int main(int argc, char** argv) {
             // the host, launch to drain: warps only notice the stop flag at a
             // poll boundary so they overrun it, and a hard-coded span would
             // inflate this.
-            const double bg_span_ms = (bg_launch_ms > 0.0) ? (now_ms() - bg_launch_ms) : 0.0;
             const double bg_ghz = (bg_on && bg_cyc && bg_span_ms > 0.0)
                 ? (double)bg_cyc / (bg_span_ms * 1e6) : 0.0;
 

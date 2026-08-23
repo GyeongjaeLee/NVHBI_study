@@ -102,6 +102,15 @@ static void spin_ms(double ms) { const double u = now_ms() + ms; while (now_ms()
 
 /* ---------------------------------------------------------------- kernels */
 
+// Records, for every block of a full-occupancy grid, which SM it landed on and
+// what the OLD code would have computed as its per-SM slot (blockIdx.x /
+// sm_count). The host then counts, per SM, how many distinct slots that yields.
+// 32 means the old assumption held; 1 means all 32 resident blocks on that SM
+// would have been given the same slot -- and with it the same 4 KiB chunk.
+__global__ void rp_block_map(unsigned int* __restrict__ smid_of_block) {
+    if (threadIdx.x == 0) smid_of_block[blockIdx.x] = nvhbi_smid();
+}
+
 // The value that belongs at absolute word index `w` for a given tag. Derived
 // from the ADDRESS, so a mismatch tells us not just "wrong value" but that the
 // write went somewhere other than where we aimed it.
@@ -389,6 +398,61 @@ int main(int argc, char** argv) {
                "  write-no-allocate those stores go to HBM, not to the remote L2.\n");
         free(h_vis);
         CHECK_CUDA(cudaFree(d_vis));
+    }
+
+    /* ====== PART B2: does block b really land on SM (b % sm_count)? ====== */
+    {
+        const unsigned int nbps_chk = bg_nbps;                 // 32, as the sweeps use
+        const unsigned int nblk = (unsigned int)t0.sm_count * nbps_chk;
+        unsigned int* d_map = nullptr;
+        CHECK_CUDA(cudaSetDevice(0));
+        CHECK_CUDA(cudaMalloc(&d_map, nblk * sizeof(unsigned int)));
+        CHECK_CUDA(cudaMemset(d_map, 0xff, nblk * sizeof(unsigned int)));
+        // 64 threads/block x 32 blocks/SM = 2048 = full occupancy, exactly the
+        // shape the stress kernels launch, so the distribution is the same one.
+        rp_block_map<<<nblk, bg_block>>>(d_map);
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaDeviceSynchronize());
+        unsigned int* h_map = (unsigned int*)malloc(nblk * sizeof(unsigned int));
+        CHECK_CUDA(cudaMemcpy(h_map, d_map, nblk * sizeof(unsigned int),
+                              cudaMemcpyDeviceToHost));
+
+        // per SM: how many DISTINCT values of (blockIdx.x / sm_count) occur
+        unsigned int worst = ~0u, best = 0u; double avg = 0.0; int nsm_seen = 0;
+        for (int sm = 0; sm < t0.sm_count; ++sm) {
+            bool seen[64] = {false};
+            unsigned int nblk_here = 0, distinct = 0;
+            for (unsigned int b = 0; b < nblk; ++b) {
+                if (h_map[b] != (unsigned int)sm) continue;
+                ++nblk_here;
+                const unsigned int q = b / (unsigned int)t0.sm_count;
+                if (q < 64u && !seen[q]) { seen[q] = true; ++distinct; }
+            }
+            if (!nblk_here) continue;
+            ++nsm_seen; avg += distinct;
+            if (distinct < worst) worst = distinct;
+            if (distinct > best)  best  = distinct;
+        }
+        avg /= (nsm_seen ? nsm_seen : 1);
+
+        printf("\n====== PART B2: block -> SM slot assignment ======\n");
+        printf("grid %u blocks x %u threads (full occupancy, %u blocks/SM)\n",
+               nblk, bg_block, nbps_chk);
+        printf("  distinct values of (blockIdx.x / sm_count) per SM:"
+               "  min %u, max %u, mean %.1f   (want %u)\n",
+               worst, best, avg, nbps_chk);
+        if (best < nbps_chk)
+            printf("  => the old slot formula COLLIDES. %u blocks per SM were sharing\n"
+                   "     as few as %u slots, so that many warps were pointed at the\n"
+                   "     SAME 4 KiB chunk. Writers only lose footprint; readers get\n"
+                   "     L2 hits counted as fresh fetches, which is the read\n"
+                   "     overcount. The kernels now take a per-SM ticket instead.\n",
+                   nbps_chk, worst);
+        else
+            printf("  => the old formula happened to hold here. The per-SM ticket the\n"
+                   "     kernels now use gives the same answer, without depending on it.\n");
+        free(h_map);
+        CHECK_CUDA(cudaFree(d_map));
     }
 
     /* ============= PART C: attachment, from the full 2x2x2 of dies ============= */

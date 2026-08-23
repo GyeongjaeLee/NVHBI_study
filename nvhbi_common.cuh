@@ -58,6 +58,13 @@
 #define NVHBI_POLL_MASK 1023u
 #endif
 
+// Same idea for nvhbi_peer_write, but its outer iteration is a whole pass over a
+// warp's chunk list rather than one store group, so it needs a shorter interval
+// to publish often enough for mid-flight sampling.
+#ifndef NVHBI_PEER_POLL_MASK
+#define NVHBI_PEER_POLL_MASK 63u
+#endif
+
 // Source tag, stamped into the top 4 bits of every value a writer stores.
 // 0 = off (the default, and what every bandwidth run should use). When set, the
 // stamp is folded into the initial value ONCE, before the loop, so the store
@@ -70,6 +77,44 @@
 // landing there? Set it per device (the bg on GPU0, the peer on GPU1), run the
 // window, then count the tags over the shared range with nvhbi_count_tags.
 __device__ unsigned int nvhbi_src_tag = 0u;
+
+/* ---------------------------------------------------------------- SM ticket
+
+   Which resident slot a block occupies on its SM. Both stress kernels used to
+   derive it as `blockIdx.x / sm_count`, which assumes block b lands on SM
+   b % sm_count. CUDA guarantees no such thing: if the scheduler fills SMs with
+   contiguous runs of blockIdx (GPC by GPC, which is what the hardware actually
+   tends to do), every one of the 32 blocks resident on an SM gets the SAME q,
+   and the per-warp `slot` collapses from 64 distinct values per SM to 2.
+
+   For the WRITERS that is nearly invisible: 32 warps hammering one chunk issue
+   stores at the same rate as 32 warps on 32 chunks, and the counter -- which
+   counts issued stores -- reads the same. exp1's count_ratio stays 1.0000.
+
+   For the READERS it is fatal: the first warp pulls the line, the other 31 hit
+   it in L2, and every one of them is counted as a fresh 4096 B fetch. That is
+   why a LOCAL read measured 7318 GB/s against a per-die HBM ceiling of about
+   4.1 TB/s, why the crossing read read 4901, and why both curves were
+   non-monotonic in reader count -- the collision pattern moves with the block
+   distribution.
+
+   A per-SM ticket makes the slot correct whatever the scheduler does. It is
+   left free-running and taken modulo num_blocks_per_sm, so no host-side reset
+   is needed: exactly num_blocks_per_sm blocks take a ticket on each
+   participating SM per launch, so consecutive tickets mod that count are always
+   all-distinct, and the phase simply rotates between launches. Blocks that
+   return before this point never take one.                                  */
+#define NVHBI_MAX_SMS 256
+__device__ unsigned int nvhbi_sm_ticket[NVHBI_MAX_SMS];
+
+__device__ __forceinline__ unsigned int nvhbi_block_slot(unsigned int smid,
+                                                         unsigned int blocks_per_sm) {
+    __shared__ unsigned int s_q;
+    if (threadIdx.x == 0)
+        s_q = atomicAdd(&nvhbi_sm_ticket[smid], 1u) % (blocks_per_sm ? blocks_per_sm : 1u);
+    __syncthreads();
+    return s_q;
+}
 
 __device__ __forceinline__ unsigned int nvhbi_stamp(unsigned int val, unsigned int tag) {
     return tag ? ((tag << 28) | (val & 0x0FFFFFFFu)) : val;
@@ -353,7 +398,10 @@ __global__ void nvhbi_stress_write(unsigned int* __restrict__ data,
     const unsigned int wpb   = (blockDim.x + 31u) / 32u;
     const unsigned int wib   = threadIdx.x / 32u;
     const unsigned int lane  = threadIdx.x % 32u;
-    const unsigned int q     = blockIdx.x / sm_count;
+    // Both early returns above are block-uniform (smid is the same for every
+    // thread in a block), so every thread that reaches this point does, and the
+    // __syncthreads() inside is safe.
+    const unsigned int q     = nvhbi_block_slot(smid, num_blocks_per_sm);
     const unsigned int plane_stride = wpb * num_blocks_per_sm * num_active_sm;
     const unsigned int slot  = wib + wpb * (q + num_blocks_per_sm * sm_rank);
 
@@ -482,13 +530,14 @@ __global__ void nvhbi_dual(unsigned int* __restrict__ data,
     const unsigned int wpb  = (blockDim.x + 31u) / 32u;
     const unsigned int wib  = threadIdx.x / 32u;
     const unsigned int lane = threadIdx.x % 32u;
-    const unsigned int q    = blockIdx.x / sm_count;
     const unsigned long long lanes =
         (unsigned long long)min(32u, blockDim.x - wib * 32u);
 
     const bool is_writer = (part == wp);
     if (rank >= (is_writer ? w_active_sm : r_active_sm)) return;
 
+    // Block-uniform above, so the __syncthreads() inside is safe.
+    const unsigned int q    = nvhbi_block_slot(smid, nbps);
     const unsigned int slot = wib + wpb * (q + nbps * rank);
     unsigned long long done = 0ull;
     unsigned int acc = 0u;
@@ -631,10 +680,22 @@ __global__ void nvhbi_peer_write(unsigned int* __restrict__ peer_data,
             done += 4ull;                    // 4 remote 32B sectors
             nvhbi_spin(idle_cycles);
         }
+        // Publish periodically, exactly as nvhbi_stress_write does. This used to
+        // happen only at kernel exit, which is invisible to a host that samples
+        // the counter WHILE the kernel runs -- the shared-window harness read the
+        // same 0 at both ends and reported 0.00 GB/s for the peer.
+        //
+        // A separate, finer mask than the stress kernel's: one outer iteration
+        // here is a whole pass over the warp's chunks, so at the top of the block
+        // size sweep a warp completes only ~16k of them per second and a 1024
+        // interval would publish three times in a 200 ms window.
+        if ((it & NVHBI_PEER_POLL_MASK) == NVHBI_PEER_POLL_MASK) {
+            if (progress && lane == 0u) { atomicAdd(progress, done * lanes); done = 0ull; }
+        }
         if (deadline_cycles &&
             (unsigned long long)(clock64() - t0) > deadline_cycles) stop = true;
     }
-    if (progress && lane == 0u) atomicAdd(progress, done * lanes);
+    if (progress && lane == 0u && done) atomicAdd(progress, done * lanes);
     nvhbi_st(&sink[blockIdx.x & 127u], val);
 }
 
