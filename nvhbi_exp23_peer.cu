@@ -62,6 +62,9 @@
 //      NVHBI_PEER_IDLE          spin cycles after each store group, 0 = full rate.
 //                               The continuous injection-rate knob; use it to get
 //                               sub-saturation points on the NVLink-load axis.
+//      NVHBI_TAG_CHECK          1 = stamp each writer's stores and count, after
+//                               every window, who owns each sector of the shared
+//                               range. Prints TAG rows. Use with PEER_OVERLAP=1.
 //      NVHBI_PEER_OVERLAP       1 = peer writes the SAME chunks the background
 //                               writes, 0 (default) = a disjoint region.
 //      NVHBI_BUF_MULT           default 8
@@ -135,6 +138,12 @@ int main(int argc, char** argv) {
     const double       buf_mult  = (double)env_u("NVHBI_BUF_MULT", 8u);
     const unsigned int peer_idle    = env_u("NVHBI_PEER_IDLE", 0u);
     const unsigned int peer_overlap = env_u("NVHBI_PEER_OVERLAP", 0u);
+    // Stamp each writer's stores with a source tag and, after every window,
+    // count who owns each sector of the shared range. Only meaningful with
+    // NVHBI_PEER_OVERLAP=1, where there IS a shared range. Costs nothing in the
+    // store loop (the tag is folded into the initial value) but adds a readback
+    // pass per point, so it is off by default.
+    const unsigned int tag_check = env_u("NVHBI_TAG_CHECK", 0u);
 
     // The injection axis is the peer BLOCK SIZE at a fixed blocks-per-SM;
     // sweeping the grid instead put every point past saturation (16 blocks of 128
@@ -567,6 +576,25 @@ int main(int argc, char** argv) {
     NvhbiStopFlag stop;
     nvhbi_stop_flag_create(stop);
 
+    unsigned long long* d_hist = nullptr;
+    if (tag_check) {
+        CHECK_CUDA(cudaSetDevice(0));
+        CHECK_CUDA(cudaMalloc(&d_hist, 16 * sizeof(unsigned long long)));
+        const unsigned int tag_bg = 1u, tag_peer = 2u;
+        CHECK_CUDA(cudaMemcpyToSymbol(nvhbi_src_tag, &tag_bg, sizeof(tag_bg)));
+        CHECK_CUDA(cudaSetDevice(1));
+        CHECK_CUDA(cudaMemcpyToSymbol(nvhbi_src_tag, &tag_peer, sizeof(tag_peer)));
+        CHECK_CUDA(cudaSetDevice(0));
+        printf("  tag check ON: background stores carry tag 1, peer stores tag 2.\n"
+               "    After each window the shared range is read back and every\n"
+               "    sector attributed to whoever wrote it last. A tag that never\n"
+               "    shows up is a writer that is not reaching these bytes at all,\n"
+               "    whatever its own counter says it issued.\n");
+        if (!peer_ovl)
+            printf("    NOTE: peer and background do not share a range in this run,\n"
+                   "          so the two tags will simply partition by region.\n");
+    }
+
     const unsigned int* d_peer_idx = die_list1(peer_die);   // GPU1-side list for the target die
 
     // Time-resolved trace of the background alone. exp1 measures over ms 8-25 of
@@ -777,6 +805,31 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "WARNING: peer ran %.0f ms but background deadline was %.0f ms "
                                 "-- bg_GBps is understated\n", wall_ms, bg_alive_ms);
 
+            if (tag_check && peer_bs && bg_sms) {
+                // Both writers are stopped by now: the peer hit its deadline and
+                // the background's stop flag was set and synchronised above, so
+                // the memory state is quiescent and the last writer per sector
+                // is stable.
+                const unsigned int rng = (bg_chunks < peer_chunks) ? bg_chunks : peer_chunks;
+                CHECK_CUDA(cudaSetDevice(0));
+                CHECK_CUDA(cudaMemset(d_hist, 0, 16 * sizeof(unsigned long long)));
+                nvhbi_count_tags<<<t.sm_count * 8, 128>>>(
+                    t.d_data, d_peer_own, peer_first, rng, d_hist, t.d_sink);
+                CHECK_CUDA(cudaGetLastError());
+                CHECK_CUDA(cudaDeviceSynchronize());
+                unsigned long long h[16];
+                CHECK_CUDA(cudaMemcpy(h, d_hist, sizeof(h), cudaMemcpyDeviceToHost));
+                unsigned long long tot = 0;
+                for (int i = 0; i < 16; ++i) tot += h[i];
+                unsigned long long other = tot - h[1] - h[2];
+                printf("TAG,%u,%u,%u,%llu,%llu,%llu,%.1f\n",
+                       bg_sms, peer_bs, rng,
+                       (unsigned long long)h[1], (unsigned long long)h[2],
+                       (unsigned long long)other,
+                       tot ? 100.0 * (double)h[2] / (double)tot : 0.0);
+                fflush(stdout);
+            }
+
             const double peer_gbps = (peer_ms > 0.f)
                 ? (double)peer_stores * 32.0 / (peer_ms * 1e-3) / 1e9 : 0.0;
             const double bg_gbps = (bg_sms && wall_ms > 0.0)
@@ -807,6 +860,7 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaSetDevice(0));
     CHECK_CUDA(cudaStreamDestroy(s_bg)); CHECK_CUDA(cudaFree(d_bg_prog));
     CHECK_CUDA(cudaFree(d_bg_rprog));
+    if (d_hist) CHECK_CUDA(cudaFree(d_hist));
     if (d_dma_dst) CHECK_CUDA(cudaFree(d_dma_dst));
     CHECK_CUDA(cudaFree(d_bg_cyc));
     nvhbi_stop_flag_destroy(stop);

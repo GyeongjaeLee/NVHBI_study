@@ -58,6 +58,23 @@
 #define NVHBI_POLL_MASK 1023u
 #endif
 
+// Source tag, stamped into the top 4 bits of every value a writer stores.
+// 0 = off (the default, and what every bandwidth run should use). When set, the
+// stamp is folded into the initial value ONCE, before the loop, so the store
+// loop itself is byte-for-byte the same and the measurement is unperturbed --
+// the counter just keeps incrementing the low 28 bits underneath the tag, and
+// no run comes close to 2^28 iterations.
+//
+// It exists to answer one question that no bandwidth number can: while two
+// sources write the SAME addresses concurrently, are both of them actually
+// landing there? Set it per device (the bg on GPU0, the peer on GPU1), run the
+// window, then count the tags over the shared range with nvhbi_count_tags.
+__device__ unsigned int nvhbi_src_tag = 0u;
+
+__device__ __forceinline__ unsigned int nvhbi_stamp(unsigned int val, unsigned int tag) {
+    return tag ? ((tag << 28) | (val & 0x0FFFFFFFu)) : val;
+}
+
 #define NVHBI_CHUNK_INTS  1024u          // 4KiB working/probing chunk
 #define NVHBI_CHUNK_BYTES (NVHBI_CHUNK_INTS * 4u)
 
@@ -344,7 +361,7 @@ __global__ void nvhbi_stress_write(unsigned int* __restrict__ data,
     const unsigned long long lanes =
         (unsigned long long)min(32u, blockDim.x - wib * 32u);
 
-    unsigned int val = smid * 1000003u + threadIdx.x + 1u;
+    unsigned int val = nvhbi_stamp(smid * 1000003u + threadIdx.x + 1u, nvhbi_src_tag);
     unsigned long long done = 0ull;
     const unsigned long long t0 = clock64();
 
@@ -479,7 +496,7 @@ __global__ void nvhbi_dual(unsigned int* __restrict__ data,
     if (is_writer) {
         // Writers on die A target die B: "far from SM0" when A is partition 0.
         const unsigned int* list = (wp == 0u) ? far_idx : near_idx;
-        unsigned int val = smid * 1000003u + threadIdx.x + 1u;
+        unsigned int val = nvhbi_stamp(smid * 1000003u + threadIdx.x + 1u, nvhbi_src_tag);
 #pragma unroll 1
         for (unsigned int it = 0; ; ++it) {
             nvhbi_store_group(data, list[slot], lane, val);
@@ -592,7 +609,7 @@ __global__ void nvhbi_peer_write(unsigned int* __restrict__ peer_data,
     const unsigned long long lanes =
         (unsigned long long)min(32u, blockDim.x - wib * 32u);
 
-    unsigned int val = gwarp * 2654435761u + lane + 1u;
+    unsigned int val = nvhbi_stamp(gwarp * 2654435761u + lane + 1u, nvhbi_src_tag);
     unsigned long long done = 0ull;
     const unsigned long long t0 = clock64();
     bool stop = false;
@@ -614,6 +631,42 @@ __global__ void nvhbi_peer_write(unsigned int* __restrict__ peer_data,
     }
     if (progress && lane == 0u) atomicAdd(progress, done * lanes);
     nvhbi_st(&sink[blockIdx.x & 127u], val);
+}
+
+/* --------------------------------------------------- who wrote it last?
+
+   Reads back exactly the words nvhbi_store_group writes and histograms them by
+   source tag, so a run where two writers share a range can be checked for the
+   thing a bandwidth number cannot show: that both of them are really landing on
+   those bytes at the same time. A tag that never appears means that writer is
+   not reaching this range at all, whatever its counter says it issued.
+
+   .cv on the loads: a local replica must not be allowed to answer for the home
+   copy, or the count would describe this die's cache rather than memory.      */
+__global__ void nvhbi_count_tags(const unsigned int* __restrict__ data,
+                                 const unsigned int* __restrict__ idx_list,
+                                 unsigned int first, unsigned int count,
+                                 unsigned long long* __restrict__ hist,  // [16]
+                                 unsigned int* __restrict__ sink) {
+    const unsigned int wpb    = (blockDim.x + 31u) / 32u;
+    const unsigned int wib    = threadIdx.x / 32u;
+    const unsigned int lane   = threadIdx.x % 32u;
+    const unsigned int gwarp  = blockIdx.x * wpb + wib;
+    const unsigned int nwarps = gridDim.x * wpb;
+    if (!nwarps) return;
+
+    unsigned int last = 0u;
+    for (unsigned int c = gwarp; c < count; c += nwarps) {
+        const unsigned int cidx = idx_list[first + c];
+        const unsigned int base = cidx + 128u * (lane / 4u) + 8u * (lane % 4u);
+        for (unsigned int k = 0; k < 4u; ++k) {
+            unsigned int v;
+            asm volatile("ld.global.cv.u32 %0, [%1];" : "=r"(v) : "l"(&data[base + 32u * k]));
+            atomicAdd(&hist[v >> 28], 1ull);
+            last = v;
+        }
+    }
+    nvhbi_st(&sink[nvhbi_smid()], last);
 }
 
 /* ------------------------------------------------ peer (NVLink) read kernel
