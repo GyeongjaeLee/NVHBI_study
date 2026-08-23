@@ -428,6 +428,122 @@ __global__ void nvhbi_stress_write(unsigned int* __restrict__ data,
     nvhbi_st(&sink[smid], val);
 }
 
+// L1-bypassing 4B load. One per 128B line is all it takes to pull the line.
+__device__ __forceinline__ unsigned int nvhbi_ld1(const unsigned int* addr) {
+    unsigned int v;
+    asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(v) : "l"(addr));
+    return v;
+}
+
+/* ---------------------------------------------------------------------------
+   One launch, two roles, split by which die the SM sits on. Writers push A->B,
+   readers pull A->B. Both count in 32B sectors so the counters simply add.
+   --------------------------------------------------------------------------- */
+__global__ void nvhbi_dual(unsigned int* __restrict__ data,
+                           const unsigned int* __restrict__ far_idx,
+                           const unsigned int* __restrict__ near_idx,
+                           const unsigned int* __restrict__ sm_side,
+                           unsigned int wp,              // die A: the writing die
+                           unsigned int w_active_sm,
+                           unsigned int r_active_sm,
+                           unsigned int r_local,
+                           unsigned int nbps,
+                           unsigned int sm_count,
+                           unsigned int r_count,         // chunks in the read sweep
+                           unsigned int r_first,         // first chunk of the read sweep
+                           unsigned int r_evict_first,   // L2 hint on the reads
+                           unsigned long long deadline_cycles,
+                           const unsigned int* __restrict__ stop_flag,
+                           unsigned long long* __restrict__ w_prog,
+                           unsigned long long* __restrict__ r_prog,
+                           unsigned int* __restrict__ sink) {
+    const unsigned int smid = nvhbi_smid();
+    const unsigned int part = sm_side[smid] % 2u;
+    const unsigned int rank = sm_side[smid] / 2u;
+
+    const unsigned int wpb  = (blockDim.x + 31u) / 32u;
+    const unsigned int wib  = threadIdx.x / 32u;
+    const unsigned int lane = threadIdx.x % 32u;
+    const unsigned int q    = blockIdx.x / sm_count;
+    const unsigned long long lanes =
+        (unsigned long long)min(32u, blockDim.x - wib * 32u);
+
+    const bool is_writer = (part == wp);
+    if (rank >= (is_writer ? w_active_sm : r_active_sm)) return;
+
+    const unsigned int slot = wib + wpb * (q + nbps * rank);
+    unsigned long long done = 0ull;
+    unsigned int acc = 0u;
+    const unsigned long long t0 = clock64();
+
+    if (is_writer) {
+        // Writers on die A target die B: "far from SM0" when A is partition 0.
+        const unsigned int* list = (wp == 0u) ? far_idx : near_idx;
+        unsigned int val = smid * 1000003u + threadIdx.x + 1u;
+#pragma unroll 1
+        for (unsigned int it = 0; ; ++it) {
+            nvhbi_store_group(data, list[slot], lane, val);
+            ++val;
+            done += 4ull;
+            if ((it & NVHBI_POLL_MASK) == NVHBI_POLL_MASK) {
+                if (w_prog && lane == 0u) { atomicAdd(w_prog, done * lanes); done = 0ull; }
+                if ((unsigned long long)(clock64() - t0) > deadline_cycles) break;
+                if (stop_flag && *(volatile const unsigned int*)stop_flag) break;
+            }
+        }
+        if (w_prog && lane == 0u && done) atomicAdd(w_prog, done * lanes);
+    } else {
+        if (r_count == 0u) return;
+        // Readers on die B pull from die A (or from die B for the control).
+        // Each active warp starts on its own chunk and advances by the number
+        // of active warps, so together they sweep the list linearly and revisit
+        // a chunk only after a full pass -- by which time its replica is gone.
+        //
+        // r_first steps the CONTROL (r_local=1) past the writers' chunks. Without
+        // it the local readers walk the whole die-B list starting at chunk 0,
+        // which is exactly the range the writers are storing into: the control
+        // then measures read/write sharing on the same lines on top of the L2
+        // pressure it is supposed to isolate.
+        const unsigned int* list = r_local ? ((wp == 0u) ? far_idx  : near_idx)
+                                           : ((wp == 0u) ? near_idx : far_idx);
+        const unsigned int nwarps = wpb * nbps * r_active_sm;
+        unsigned int c = (slot >= r_count) ? (slot % r_count) : slot;
+        // The hint choice is loop-invariant and the loop body is ONE load, so
+        // testing it per iteration would be a large fraction of the work.
+        if (r_evict_first) {
+#pragma unroll 1
+            for (unsigned int it = 0; ; ++it) {
+                // byte 128*lane: 32 lanes cover the 32 lines of the 4KiB chunk,
+                // one instruction, 4 sectors pulled per lane.
+                acc += nvhbi_ld_stream(&data[list[r_first + c] + 32u * lane]);
+                done += 4ull;
+                c += nwarps;
+                if (c >= r_count) c = (c >= 2u * r_count) ? (c % r_count) : (c - r_count);
+                if ((it & NVHBI_POLL_MASK) == NVHBI_POLL_MASK) {
+                    if (r_prog && lane == 0u) { atomicAdd(r_prog, done * lanes); done = 0ull; }
+                    if ((unsigned long long)(clock64() - t0) > deadline_cycles) break;
+                    if (stop_flag && *(volatile const unsigned int*)stop_flag) break;
+                }
+            }
+        } else {
+#pragma unroll 1
+            for (unsigned int it = 0; ; ++it) {
+                acc += nvhbi_ld1(&data[list[r_first + c] + 32u * lane]);
+                done += 4ull;
+                c += nwarps;
+                if (c >= r_count) c = (c >= 2u * r_count) ? (c % r_count) : (c - r_count);
+                if ((it & NVHBI_POLL_MASK) == NVHBI_POLL_MASK) {
+                    if (r_prog && lane == 0u) { atomicAdd(r_prog, done * lanes); done = 0ull; }
+                    if ((unsigned long long)(clock64() - t0) > deadline_cycles) break;
+                    if (stop_flag && *(volatile const unsigned int*)stop_flag) break;
+                }
+            }
+        }
+        if (r_prog && lane == 0u && done) atomicAdd(r_prog, done * lanes);
+    }
+    nvhbi_st(&sink[smid], acc + (unsigned int)done);
+}
+
 /* ----------------------------------------------- peer (NVLink) write kernel
 
    Runs on the *remote* GPU and stores into `peer_data`, a pointer into the
