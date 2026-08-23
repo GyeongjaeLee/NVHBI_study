@@ -71,8 +71,6 @@
 //                               at the widest point of the sweep -- a warp with no
 //                               chunk of its own contributes nothing.
 //      NVHBI_BG_BLOCK / NVHBI_BG_BLOCKS_PER_SM / NVHBI_BG_LINES
-//      NVHBI_PEER_MODE          0 = GPU1 kernel P2P stores (default)
-//                               1 = cudaMemcpyPeerAsync (copy engines, die-agnostic)
 //      NVHBI_PEER_IDLE          spin cycles after each store group, 0 = full rate.
 //                               The continuous injection-rate knob; use it to get
 //                               sub-saturation points on the NVLink-load axis.
@@ -144,6 +142,19 @@ int main(int argc, char** argv) {
     // side. Sweeping, plus the read-alone rows that bg_sms=0 now produces,
     // compares the two harnesses point by point instead of at one guess.
     const unsigned int window_ms = env_u("NVHBI_WINDOW_MS", 200u);
+    // Every stream is launched, allowed to settle, then sampled over ONE shared
+    // window. peer_margin_ms is how much longer the peer's deadline runs past
+    // that window (nvhbi_peer_write has no stop flag, so it drains on its own).
+    const unsigned int settle_ms = env_u("NVHBI_SETTLE_MS", 100u);
+    const unsigned int peer_margin_ms = env_u("NVHBI_PEER_MARGIN_MS", 60u);
+    // Readers stay on their own die. Nothing crosses on the read side, so the
+    // SAME kernel and the SAME accounting measure a LOCAL read -- which is the
+    // only in-run calibration available for the read byte count. Compare a
+    // crossing read against the local read from the same session rather than
+    // against a datasheet: the ratio is meaningful even if the absolute scale
+    // is not. It is also the control that showed crossing reads cost the
+    // writers 55% while local reads at twice the rate cost them 0%.
+    const unsigned int bg_r_local = env_u("NVHBI_BG_R_LOCAL", 0u);
     const unsigned int repeat    = env_u("NVHBI_REPEAT", 3u);
     // How GPU1 pushes into GPU0:
     //   0 = a kernel on GPU1 dereferencing GPU0 pointers (P2P load/store, SMs)
@@ -155,6 +166,15 @@ int main(int argc, char** argv) {
     // dies interleave at 4KiB -- so it lands ~50/50 and the exp2/exp3 (far/near)
     // distinction does not apply to it.
     const unsigned int peer_mode = env_u("NVHBI_PEER_MODE", 0u);
+    if (peer_mode != 0u) {
+        fprintf(stderr, "ERROR: NVHBI_PEER_MODE=1 (cudaMemcpyPeerAsync) is not supported\n"
+                        "       any more. Every stream is now sampled from an in-kernel\n"
+                        "       counter over one shared window so that the background and\n"
+                        "       the peer are measured the same way; a copy-engine path has\n"
+                        "       no such counter and would reintroduce exactly the\n"
+                        "       two-different-statistics problem this replaced.\n");
+        return 1;
+    }
     const double       buf_mult  = (double)env_u("NVHBI_BUF_MULT", 8u);
     const unsigned int peer_idle    = env_u("NVHBI_PEER_IDLE", 0u);
     const unsigned int peer_overlap = env_u("NVHBI_PEER_OVERLAP", 0u);
@@ -242,11 +262,6 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMalloc(&d_lat, sizeof(unsigned int)));
     unsigned long long* d_peer_prog = nullptr;
     CHECK_CUDA(cudaMalloc(&d_peer_prog, sizeof(unsigned long long)));
-
-    // DMA buffers for peer_mode 1. Destination is a plain contiguous GPU0
-    // allocation, hence die-agnostic.
-    unsigned int *d_dma_src = nullptr, *d_dma_dst = nullptr;
-    size_t dma_bytes = 0;
 
     cudaStream_t s_peer;
     CHECK_CUDA(cudaStreamCreateWithFlags(&s_peer, cudaStreamNonBlocking));
@@ -533,18 +548,7 @@ int main(int argc, char** argv) {
     }
 
     /* -------- background machinery on GPU0 -------- */
-    if (peer_mode == 1u) {
-        dma_bytes = (size_t)peer_chunks * NVHBI_CHUNK_BYTES;
-        CHECK_CUDA(cudaSetDevice(1));
-        CHECK_CUDA(cudaMalloc(&d_dma_src, dma_bytes));
-        CHECK_CUDA(cudaMemset(d_dma_src, 0x3c, dma_bytes));
-        CHECK_CUDA(cudaSetDevice(0));
-        CHECK_CUDA(cudaMalloc(&d_dma_dst, dma_bytes));
-        printf("  peer path: cudaMemcpyPeerAsync, %.1f MB per copy (DIE-AGNOSTIC)\n",
-               dma_bytes / 1048576.0);
-    } else {
-        printf("  peer path: GPU1 kernel storing into GPU0 (P2P load/store)\n");
-    }
+    printf("  peer path: GPU1 kernel storing into GPU0 (P2P load/store)\n");
 
     CHECK_CUDA(cudaSetDevice(0));
     cudaStream_t s_bg;
@@ -669,139 +673,138 @@ int main(int argc, char** argv) {
             CHECK_CUDA(cudaGetLastError());
             CHECK_CUDA(cudaDeviceSynchronize());
 
-            /* start background, settle */
-            double bg_launch_ms = 0.0;
+            /* ---------------------------------------------------------------
+               ONE window, ONE method, for every stream.
+
+               Both loads are launched, both settle, and then the host samples
+               every in-kernel counter at the same two instants and divides by
+               the same elapsed time. That is exactly what exp1's sampled_GBps
+               and nvhbi_dualdir already do, so all four programs now report the
+               same statistic and their numbers can be put in one table.
+
+               What this replaces: the peer used to be timed with cudaEvents over
+               its WHOLE kernel while the background was sampled mid-flight over
+               a host window. Two different statistics over two different
+               intervals -- which is not a defensible way to ask whether one
+               stream is slowing the other down, however small the difference
+               turns out to be.
+
+               The peer's deadline therefore has to outlast settle + window; it
+               is given a margin and simply runs out afterwards (nvhbi_peer_write
+               has no stop flag, and the drain costs one margin per point).
+               --------------------------------------------------------------- */
+            const unsigned long long bg_dl =
+                (unsigned long long)(settle_ms + 3u * window_ms + 2000u)
+                * (unsigned long long)t.clock_khz;
+            const unsigned long long peer_dl =
+                (unsigned long long)(settle_ms + window_ms + peer_margin_ms)
+                * (unsigned long long)prop1_clock_khz;
+
             CHECK_CUDA(cudaMemset(d_bg_prog, 0, sizeof(unsigned long long)));
             CHECK_CUDA(cudaMemset(d_bg_rprog, 0, sizeof(unsigned long long)));
             CHECK_CUDA(cudaMemset(d_bg_cyc, 0, sizeof(unsigned long long)));
             nvhbi_stop_flag_reset(stop);
+
+            // Clamp the peer grid. Two ways it silently broke the sweep before:
+            //  * more blocks than fit resident -> each WAVE runs the full
+            //    deadline, so the span became waves x window.
+            //  * more warps than chunks -> the surplus warps own no chunk and
+            //    just spin, adding waves without adding traffic.
+            unsigned int pb = 0u, bps = 0u;
+            if (peer_bs) {
+                const unsigned int wpb = (peer_bs + 31u) / 32u;
+                bps = resident_bps(peer_bs, peer_nbps);
+                pb  = (unsigned int)prop1.multiProcessorCount * bps;
+                unsigned int useful = peer_chunks / wpb;
+                if (!useful) useful = 1u;
+                if (pb > useful) pb = useful;
+            }
+
+            double bg_launch_ms = 0.0;
             if (bg_on) {
-                // Must outlast settle + the whole peer kernel, or the counter
-                // delta gets divided by a window the background was not alive
-                // for. That artifact produced the fake "bg dropped to 120 GB/s"
-                // rows at peer_blocks=16384.
-                const unsigned long long dl =
-                    (unsigned long long)(4u * window_ms + 2000u) * (unsigned long long)t.clock_khz;
+                CHECK_CUDA(cudaSetDevice(0));
                 if (bg_r_sms) {
-                    // Fused write+read background. r_local follows bg_local, so
-                    // the control still crosses nothing on either payload.
                     nvhbi_dual<<<t.sm_count * bg_nbps, bg_block, 0, s_bg>>>(
                         t.d_data, t.d_far_idx, t.d_near_idx, t.d_sm_side,
-                        bg_writer_partition, bg_sms, bg_r_sms, /*r_local=*/0u, bg_nbps,
-                        (unsigned int)t.sm_count,
-                        bg_r_sms ? bg_r_chunks : 0u, bg_r_first,
-                        /*r_evict_first=*/1u, dl, stop.d,
+                        bg_writer_partition, bg_sms, bg_r_sms, bg_r_local, bg_nbps,
+                        (unsigned int)t.sm_count, bg_r_chunks, bg_r_first,
+                        /*r_evict_first=*/1u, bg_dl, stop.d,
                         d_bg_prog, d_bg_rprog, d_bg_cyc, t.d_sink);
                 } else {
                     nvhbi_stress_write<<<t.sm_count * bg_nbps, bg_block, 0, s_bg>>>(
                         t.d_data, t.d_far_idx, t.d_near_idx, t.d_sm_side,
                         bg_writer_partition, bg_local, bg_sms, bg_nbps,
                         (unsigned int)t.sm_count, bg_lines, 0u,
-                        0u, dl, stop.d, d_bg_prog, d_bg_cyc, nullptr, t.d_sink);
+                        0u, bg_dl, stop.d, d_bg_prog, d_bg_cyc, nullptr, t.d_sink);
                 }
                 CHECK_CUDA(cudaGetLastError());
                 bg_launch_ms = now_ms();
-                spin_ms(100.0);
             }
 
-            /* measurement window */
-            unsigned long long bg_p0 = 0, bg_p1 = 0, peer_stores = 0;
-            unsigned long long bg_r0 = 0, bg_r1 = 0;
-            CHECK_CUDA(cudaMemcpy(&bg_p0, d_bg_prog, sizeof(bg_p0), cudaMemcpyDeviceToHost));
-            if (bg_on)
-                CHECK_CUDA(cudaMemcpy(&bg_r0, d_bg_rprog, sizeof(bg_r0), cudaMemcpyDeviceToHost));
-            // Clamp the peer grid. Two ways it silently broke the sweep before:
-            //  * more blocks than fit resident -> each WAVE runs the full deadline,
-            //    so peer_ms became waves x window (200 -> 1402 ms at 16384 blocks)
-            //    and peer_GBps fell by exactly that factor.
-            //  * more warps than chunks -> the surplus warps own no chunk and just
-            //    spin, adding waves without adding traffic.
-            // wpb is forced to at least 1 -- the old peer_block/32 was 0 for any
-            // sub-warp block size and the `useful` division below then divided by
-            // zero, which would have crashed the moment this axis went below 32.
-            unsigned int pb = 0u, bps = 0u;
-            if (peer_bs) {
-                const unsigned int wpb = (peer_bs + 31u) / 32u;
-                bps = resident_bps(peer_bs, peer_nbps);
-                pb  = (unsigned int)prop1.multiProcessorCount * bps;
-                unsigned int useful = peer_chunks / wpb;      // blocks, so warps <= chunks
-                if (!useful) useful = 1u;
-                if (pb > useful) {
-                    pb = useful;
-                    fprintf(stderr, "note: block size %u: grid %u -> %u blocks "
-                                    "(only %u chunks for %u warps/block)\n",
-                            peer_bs, (unsigned int)prop1.multiProcessorCount * bps,
-                            pb, peer_chunks, wpb);
-                }
-                if (bps != peer_nbps)
-                    fprintf(stderr, "note: block size %u: %u -> %u blocks/SM "
-                                    "(2048 threads/SM and 32 block slots)\n",
-                            peer_bs, peer_nbps, bps);
-            }
-
-            float peer_ms = 0.f;
-            const double wall0 = now_ms();
-            if (pb && peer_bs && peer_mode == 1u) {
-                // Keep the copy engines busy for the whole window, then divide
-                // the bytes actually copied by the time they took.
-                CHECK_CUDA(cudaSetDevice(1));
-                CHECK_CUDA(cudaEventRecord(pe0, s_peer));
-                unsigned int ncopy = 0u;
-                const double until = now_ms() + (double)window_ms;
-                while (now_ms() < until) {
-                    CHECK_CUDA(cudaMemcpyPeerAsync(d_dma_dst, 0, d_dma_src, 1,
-                                                   dma_bytes, s_peer));
-                    ++ncopy;
-                    if ((ncopy & 15u) == 0u) CHECK_CUDA(cudaStreamSynchronize(s_peer));
-                }
-                CHECK_CUDA(cudaEventRecord(pe1, s_peer));
-                CHECK_CUDA(cudaStreamSynchronize(s_peer));
-                CHECK_CUDA(cudaEventElapsedTime(&peer_ms, pe0, pe1));
-                // Report DMA in the same units as the kernel path: 32B sectors.
-                peer_stores = (unsigned long long)ncopy * (dma_bytes / 32u);
-            } else if (pb && peer_bs) {
+            bool peer_running = false;
+            if (pb && peer_bs) {
                 CHECK_CUDA(cudaSetDevice(1));
                 CHECK_CUDA(cudaMemset(d_peer_prog, 0, sizeof(unsigned long long)));
-                const unsigned long long pdl =
-                    (unsigned long long)window_ms * (unsigned long long)prop1_clock_khz;
-                CHECK_CUDA(cudaEventRecord(pe0, s_peer));
                 nvhbi_peer_write<<<pb, peer_bs, 0, s_peer>>>(
-                    t.d_data, d_peer_idx, peer_first, peer_chunks, 0u, pdl,
+                    t.d_data, d_peer_idx, peer_first, peer_chunks, 0u, peer_dl,
                     peer_idle, d_peer_prog, d_sink1);
-                CHECK_CUDA(cudaEventRecord(pe1, s_peer));
                 CHECK_CUDA(cudaGetLastError());
-                CHECK_CUDA(cudaStreamSynchronize(s_peer));
-                CHECK_CUDA(cudaEventElapsedTime(&peer_ms, pe0, pe1));
-                CHECK_CUDA(cudaMemcpy(&peer_stores, d_peer_prog, sizeof(peer_stores), cudaMemcpyDeviceToHost));
-            } else {
-                spin_ms((double)window_ms);
+                peer_running = true;
+                CHECK_CUDA(cudaSetDevice(0));
             }
-            const double wall_ms = now_ms() - wall0;
 
-            CHECK_CUDA(cudaSetDevice(0));
-            CHECK_CUDA(cudaMemcpy(&bg_p1, d_bg_prog, sizeof(bg_p1), cudaMemcpyDeviceToHost));
-            if (bg_on)
-                CHECK_CUDA(cudaMemcpy(&bg_r1, d_bg_rprog, sizeof(bg_r1), cudaMemcpyDeviceToHost));
+            spin_ms((double)settle_ms);
+
+            /* ---- sample: every counter at the same instant, both ends ---- */
+            unsigned long long bg_p0 = 0, bg_p1 = 0, bg_r0 = 0, bg_r1 = 0;
+            unsigned long long pq0 = 0, pq1 = 0;
+            auto sample = [&](unsigned long long* w, unsigned long long* r,
+                              unsigned long long* q) {
+                if (bg_on) {
+                    CHECK_CUDA(cudaSetDevice(0));
+                    CHECK_CUDA(cudaMemcpy(w, d_bg_prog, sizeof(*w), cudaMemcpyDeviceToHost));
+                    CHECK_CUDA(cudaMemcpy(r, d_bg_rprog, sizeof(*r), cudaMemcpyDeviceToHost));
+                }
+                if (peer_running) {
+                    CHECK_CUDA(cudaSetDevice(1));
+                    CHECK_CUDA(cudaMemcpy(q, d_peer_prog, sizeof(*q), cudaMemcpyDeviceToHost));
+                    CHECK_CUDA(cudaSetDevice(0));
+                }
+            };
+            // Stamp the clock AFTER the copies land at both ends, so the same
+            // bias sits on each and cancels in the interval.
+            sample(&bg_p0, &bg_r0, &pq0);
+            const double t_a = now_ms();
+            while (now_ms() - t_a < (double)window_ms) { }
+            sample(&bg_p1, &bg_r1, &pq1);
+            const double t_b = now_ms();
+            const double win_ms = t_b - t_a;
+
+            const unsigned long long peer_stores = pq1 - pq0;
+            const float peer_ms = (float)win_ms;
+
             unsigned long long bg_cyc = 0ull;
             if (bg_on) {
                 nvhbi_stop_flag_set(stop);
+                CHECK_CUDA(cudaSetDevice(0));
                 CHECK_CUDA(cudaStreamSynchronize(s_bg));
                 CHECK_CUDA(cudaMemcpy(&bg_cyc, d_bg_cyc, sizeof(bg_cyc),
                                       cudaMemcpyDeviceToHost));
             }
-            // Clock the background actually achieved. Measure the span from the
-            // host, launch to drain: warps only notice the stop flag at a poll
-            // boundary, so they overrun it, and a hard-coded span would inflate
-            // this. (With NVHBI_POLL_MASK=65535 the overrun reached ~267 ms
-            // against an assumed 300 ms span and reported 2.1 GHz.)
+            if (peer_running) {
+                CHECK_CUDA(cudaSetDevice(1));
+                CHECK_CUDA(cudaStreamSynchronize(s_peer));
+                CHECK_CUDA(cudaSetDevice(0));
+            }
+            const double wall_ms = win_ms;
+
+            // Clock the background actually achieved. The span is measured from
+            // the host, launch to drain: warps only notice the stop flag at a
+            // poll boundary so they overrun it, and a hard-coded span would
+            // inflate this.
             const double bg_span_ms = (bg_launch_ms > 0.0) ? (now_ms() - bg_launch_ms) : 0.0;
             const double bg_ghz = (bg_on && bg_cyc && bg_span_ms > 0.0)
                 ? (double)bg_cyc / (bg_span_ms * 1e6) : 0.0;
-
-            const double bg_alive_ms = (double)(4u * window_ms + 2000u) - 100.0;
-            if (bg_on && wall_ms > bg_alive_ms)
-                fprintf(stderr, "WARNING: peer ran %.0f ms but background deadline was %.0f ms "
-                                "-- bg_GBps is understated\n", wall_ms, bg_alive_ms);
 
             if (tag_check && peer_bs && bg_sms) {
                 // Both writers are stopped by now: the peer hit its deadline and
@@ -865,7 +868,6 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaStreamDestroy(s_bg)); CHECK_CUDA(cudaFree(d_bg_prog));
     CHECK_CUDA(cudaFree(d_bg_rprog));
     if (d_hist) CHECK_CUDA(cudaFree(d_hist));
-    if (d_dma_dst) CHECK_CUDA(cudaFree(d_dma_dst));
     CHECK_CUDA(cudaFree(d_bg_cyc));
     nvhbi_stop_flag_destroy(stop);
     nvhbi_free(t);
