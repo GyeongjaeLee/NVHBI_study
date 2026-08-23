@@ -59,6 +59,11 @@
 //      NVHBI_R_SMS      reader SM counts, 0=off.  default "0,8,16,32,64,78"
 //      NVHBI_R_CHUNKS   read sweep in 4KiB chunks, 0 = whole source die (default)
 //      NVHBI_R_LOCAL    1 = readers read their OWN die (crosses nothing), default 0
+//      NVHBI_W_WARM     0 = skip the write-target warm-up entirely, default 1
+//      NVHBI_R_EVICT    1 = ld.global.cs on the reads (evict-first), default 1
+//      NVHBI_L2_PERSIST 1 = reserve L2 for the write set via
+//                       cudaLimitPersistingL2CacheSize + accessPolicyWindow,
+//                       default 1
 //      NVHBI_BUF_MULT   allocation as a multiple of L2, default 64 (~4 GB/die)
 //      NVHBI_WINDOW_MS  default 200      NVHBI_REPEAT default 3
 //      NVHBI_BLOCK / NVHBI_BLOCKS_PER_SM   default 64 / 32
@@ -222,12 +227,17 @@ int main(int argc, char** argv) {
     // hinting will change the answer -- the cost is L2/fabric bandwidth, which
     // is what we want to measure anyway. Run both before tuning hints.
     const unsigned int w_warm    = env_u("NVHBI_W_WARM", 1u);
-    // L2 replacement hints. r_evict marks the streaming reads evict-first so
-    // they stop displacing everything; w_keep installs the write targets
-    // evict-last. Defaults ON -- they can only help -- but A/B them, because
-    // .cs/.cv were tried before and did nothing (see the note at the top).
-    const unsigned int r_evict   = env_u("NVHBI_R_EVICT", 1u);
-    const unsigned int w_keep    = env_u("NVHBI_W_KEEP", 1u);
+    // Two different levers, do not confuse them.
+    //  r_evict : ld.global.cs on the reads -- evict-first in L1 and L2, so a
+    //            line read once stops displacing things. A preference only.
+    //            This is the .cs that was tried before and moved reads ~5%.
+    //  l2_persist : the real one. cudaLimitPersistingL2CacheSize physically
+    //            RESERVES a slice of L2 that normal and streaming lines cannot
+    //            occupy, and an accessPolicyWindow over the write region marks
+    //            it persisting. Unlike a replacement hint this survives a reader
+    //            that turns the whole L2 over every few tens of microseconds.
+    const unsigned int r_evict    = env_u("NVHBI_R_EVICT", 1u);
+    const unsigned int l2_persist = env_u("NVHBI_L2_PERSIST", 1u);
     const double       buf_mult  = (double)env_u("NVHBI_BUF_MULT", 64u);
 
     unsigned int w_list[16], r_list[16];
@@ -251,10 +261,16 @@ int main(int argc, char** argv) {
     for (int i = 0; i < w_n; ++i)
         w_max_chunks = max(w_max_chunks, nvhbi_chunks_used(w_list[i], nbps, block, 1u));
 
-    // The crossing readers pull from the OTHER die, so they cannot collide with
-    // the writers' chunks; the local control shares a die with them and must be
-    // stepped past the write region.
-    const unsigned int r_first = r_local ? w_max_chunks : 0u;
+    // Step the readers past the write region in BOTH modes. The local control
+    // needs it because it shares a die with the writers and would otherwise
+    // read the very lines they are storing into. The crossing readers need it
+    // because the L2 persisting window below is an address range that spans
+    // both dies' chunks, and a reader sweeping from chunk 0 would run straight
+    // through it and get marked persisting.
+    // +256 chunks of margin: the window is defined by die-B chunk ADDRESSES and
+    // the readers index the die-A list, so "one past the last write chunk" is
+    // only just past the window edge. A megabyte of slack costs nothing here.
+    const unsigned int r_first = w_max_chunks + 256u;
     unsigned int r_chunks = env_u("NVHBI_R_CHUNKS", 0u);
     const unsigned int r_room = (r_avail > r_first) ? (r_avail - r_first) : 0u;
     if (!r_chunks || r_chunks > r_room) r_chunks = r_room;
@@ -278,8 +294,54 @@ int main(int argc, char** argv) {
            r_chunks * 4096.0 / 1048576.0,
            r_chunks * 4096.0 / (t.l2_bytes / 2.0),
            r_local ? "   [CONTROL: crosses nothing]" : "");
-    printf("  hints: write set warmed=%u evict_last=%u, reads evict_first=%u\n",
-           w_warm, w_keep, r_evict);
+    printf("  hints: write set warmed=%u, reads ld.global.cs=%u\n", w_warm, r_evict);
+
+    cudaStream_t s;
+    CHECK_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+
+    /* ---- L2 residency control over the write region ----------------------
+       The window is an ADDRESS RANGE, but the write chunks are die-B chunks
+       interleaved with die-A's, so the range that contains them is about twice
+       their bytes and holds die-A chunks too. That is only safe because the
+       readers are stepped past it (r_first below): if their sweep started at
+       chunk 0 they would run through this window and be marked persisting --
+       the exact opposite of the intent. */
+    size_t persist_bytes = 0;
+    if (l2_persist && w_max_chunks) {
+        const unsigned int* h_wlist = (w_target_die == 1u) ? t.h_far_idx : t.h_near_idx;
+        const size_t lo   = (size_t)h_wlist[0] * 4u;
+        const size_t hi   = ((size_t)h_wlist[w_max_chunks - 1] + NVHBI_CHUNK_INTS) * 4u;
+        size_t span       = hi - lo;
+
+        int max_persist = 0, max_window = 0;
+        CHECK_CUDA(cudaDeviceGetAttribute(&max_persist,
+                                          cudaDevAttrMaxPersistingL2CacheSize, t.device));
+        CHECK_CUDA(cudaDeviceGetAttribute(&max_window,
+                                          cudaDevAttrMaxAccessPolicyWindowSize, t.device));
+        if (span > (size_t)max_window) span = (size_t)max_window;
+        persist_bytes = span < (size_t)max_persist ? span : (size_t)max_persist;
+
+        CHECK_CUDA(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persist_bytes));
+
+        cudaStreamAttrValue av = {};
+        av.accessPolicyWindow.base_ptr  = (void*)((char*)t.d_data + lo);
+        av.accessPolicyWindow.num_bytes = span;
+        av.accessPolicyWindow.hitRatio  = 1.0f;
+        av.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+        av.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+        CHECK_CUDA(cudaStreamSetAttribute(s, cudaStreamAttributeAccessPolicyWindow, &av));
+
+        printf("  L2 residency: window %.1f MB at +%.1f MB, carve-out %.1f MB "
+               "of %.1f MB allowed (per-die L2 is %.1f MB)\n",
+               span / 1048576.0, lo / 1048576.0, persist_bytes / 1048576.0,
+               max_persist / 1048576.0, t.l2_bytes / 2.0 / 1048576.0);
+        if (persist_bytes < span)
+            printf("  NOTE: the carve-out is smaller than the window, so only part of\n"
+                   "        the write set can be held. Lower NVHBI_W_SMS to shrink it.\n");
+    } else {
+        printf("  L2 residency: off\n");
+    }
+
     // dieB_GBps is everything arriving at die B's L2: the writes crossing into
     // it plus, for a crossing read, the lines the reads fill into it. exp3's
     // bg_local=1 point put a die's L2 write acceptance at ~4.88 TB/s, so this
@@ -287,8 +349,6 @@ int main(int argc, char** argv) {
     // L2 -- the two explanations the write-only experiments cannot separate.
     printf("# CFG,w_sms,r_sms,r_local,rep,write_GBps,read_GBps,total_GBps,dieB_GBps\n");
 
-    cudaStream_t s;
-    CHECK_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     unsigned long long *d_wprog = nullptr, *d_rprog = nullptr;
     CHECK_CUDA(cudaMalloc(&d_wprog, sizeof(unsigned long long)));
     CHECK_CUDA(cudaMalloc(&d_rprog, sizeof(unsigned long long)));
@@ -307,7 +367,9 @@ int main(int argc, char** argv) {
             // Only the write targets are warmed. The read sweep is far larger
             // than L2 by construction, so it comes from the source die's HBM.
             if (w_chunks && w_warm) {
-                nvhbi_warm(t, d_wlist, 0u, w_chunks, w_target_die, w_keep);
+                // On the policy stream, or the window would not apply to the
+                // very loads that install the lines we are trying to keep.
+                nvhbi_warm(t, d_wlist, 0u, w_chunks, w_target_die, s);
             }
             CHECK_CUDA(cudaDeviceSynchronize());
 
@@ -350,6 +412,12 @@ int main(int argc, char** argv) {
         }
     }}
 
+    if (persist_bytes) {
+        cudaStreamAttrValue av = {};
+        CHECK_CUDA(cudaStreamSetAttribute(s, cudaStreamAttributeAccessPolicyWindow, &av));
+        CHECK_CUDA(cudaCtxResetPersistingL2Cache());
+        CHECK_CUDA(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0));
+    }
     CHECK_CUDA(cudaStreamDestroy(s));
     CHECK_CUDA(cudaFree(d_wprog));
     CHECK_CUDA(cudaFree(d_rprog));
