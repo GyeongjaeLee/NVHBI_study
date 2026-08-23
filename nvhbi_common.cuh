@@ -81,6 +81,36 @@ __device__ __forceinline__ unsigned int nvhbi_ld(const unsigned int* addr) {
     return v;
 }
 
+// L2-level replacement hints (sm_80+, PTX 7.4+). These are NOT the same knob as
+// .cs / .cv, which bias L1 first; these name the L2 replacement priority
+// directly, which is the only level that matters here -- the working set under
+// discussion lives in the home die's L2 and is being churned by a reader on the
+// other die.
+//
+//   evict_last  : "keep this line". For the warm-up that installs the write
+//                 target set, so a streaming reader has to work harder to
+//                 displace it.
+//   evict_first : "throw this line out first". For the streaming reader, whose
+//                 lines are read exactly once and should never displace
+//                 anything.
+//
+// Neither is a guarantee. evict_last only reorders replacement candidates
+// within a set, so a reader that turns the whole L2 over every few tens of
+// microseconds will still win eventually. If the hints are not enough the next
+// lever is cudaLimitPersistingL2CacheSize plus an accessPolicyWindow, which
+// physically reserves part of L2 that streaming lines cannot occupy.
+__device__ __forceinline__ unsigned int nvhbi_ld_keep(const unsigned int* addr) {
+    unsigned int v;
+    asm volatile("ld.global.cg.L2::evict_last.u32 %0, [%1];" : "=r"(v) : "l"(addr));
+    return v;
+}
+
+__device__ __forceinline__ unsigned int nvhbi_ld_stream(const unsigned int* addr) {
+    unsigned int v;
+    asm volatile("ld.global.cg.L2::evict_first.u32 %0, [%1];" : "=r"(v) : "l"(addr));
+    return v;
+}
+
 // clock64() with a memory clobber. Plain clock64() is free to be scheduled
 // across memory operations, which is fatal for latency timing.
 __device__ __forceinline__ unsigned long long nvhbi_clock() {
@@ -237,6 +267,7 @@ __global__ void nvhbi_warm_chunks(unsigned int* __restrict__ data,
                                   const unsigned int* __restrict__ sm_side,
                                   unsigned int owner_partition,
                                   unsigned int* __restrict__ cursor,
+                                  unsigned int evict_last,
                                   unsigned int* __restrict__ sink) {
     const unsigned int smid = nvhbi_smid();
     if ((sm_side[smid] % 2u) != owner_partition) return;
@@ -250,10 +281,17 @@ __global__ void nvhbi_warm_chunks(unsigned int* __restrict__ data,
         if (c >= count) break;
         unsigned int* a[4];
         nvhbi_lane_addrs(data, idx_list[first + c], lane, a);
-        consume += nvhbi_ld(a[0]);
-        consume += nvhbi_ld(a[1]);
-        consume += nvhbi_ld(a[2]);
-        consume += nvhbi_ld(a[3]);
+        if (evict_last) {
+            consume += nvhbi_ld_keep(a[0]);
+            consume += nvhbi_ld_keep(a[1]);
+            consume += nvhbi_ld_keep(a[2]);
+            consume += nvhbi_ld_keep(a[3]);
+        } else {
+            consume += nvhbi_ld(a[0]);
+            consume += nvhbi_ld(a[1]);
+            consume += nvhbi_ld(a[2]);
+            consume += nvhbi_ld(a[3]);
+        }
     }
     nvhbi_st(&sink[smid], consume);
 }
@@ -715,14 +753,15 @@ static void nvhbi_flush_l2(const NvhbiTopo& t) {
 // coverage is the whole range every time. Issued on the default stream, like
 // the raw launch it replaces, so an existing cudaDeviceSynchronize() at the
 // call site still orders it.
+// evict_last=1 installs the lines with L2 "keep me" priority; see nvhbi_ld_keep.
 static void nvhbi_warm(const NvhbiTopo& t, const unsigned int* d_list,
                        unsigned int first, unsigned int count,
-                       unsigned int owner_partition) {
+                       unsigned int owner_partition, unsigned int evict_last = 0u) {
     if (!count) return;
     CHECK_CUDA(cudaMemset(t.d_warm_cursor, 0, sizeof(unsigned int)));
     nvhbi_warm_chunks<<<t.sm_count * 8, 128>>>(t.d_data, d_list, first, count,
                                                t.d_sm_side, owner_partition,
-                                               t.d_warm_cursor, t.d_sink);
+                                               t.d_warm_cursor, evict_last, t.d_sink);
     CHECK_CUDA(cudaGetLastError());
 }
 

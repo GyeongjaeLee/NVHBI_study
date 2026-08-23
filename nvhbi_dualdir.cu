@@ -88,6 +88,8 @@ __global__ void nvhbi_dual(unsigned int* __restrict__ data,
                            unsigned int nbps,
                            unsigned int sm_count,
                            unsigned int r_count,         // chunks in the read sweep
+                           unsigned int r_first,         // first chunk of the read sweep
+                           unsigned int r_evict_first,   // L2 hint on the reads
                            unsigned long long deadline_cycles,
                            const unsigned int* __restrict__ stop_flag,
                            unsigned long long* __restrict__ w_prog,
@@ -134,22 +136,45 @@ __global__ void nvhbi_dual(unsigned int* __restrict__ data,
         // Each active warp starts on its own chunk and advances by the number
         // of active warps, so together they sweep the list linearly and revisit
         // a chunk only after a full pass -- by which time its replica is gone.
+        //
+        // r_first steps the CONTROL (r_local=1) past the writers' chunks. Without
+        // it the local readers walk the whole die-B list starting at chunk 0,
+        // which is exactly the range the writers are storing into: the control
+        // then measures read/write sharing on the same lines on top of the L2
+        // pressure it is supposed to isolate.
         const unsigned int* list = r_local ? ((wp == 0u) ? far_idx  : near_idx)
                                            : ((wp == 0u) ? near_idx : far_idx);
         const unsigned int nwarps = wpb * nbps * r_active_sm;
         unsigned int c = (slot >= r_count) ? (slot % r_count) : slot;
+        // The hint choice is loop-invariant and the loop body is ONE load, so
+        // testing it per iteration would be a large fraction of the work.
+        if (r_evict_first) {
 #pragma unroll 1
-        for (unsigned int it = 0; ; ++it) {
-            // byte 128*lane: 32 lanes cover the 32 lines of the 4KiB chunk,
-            // one instruction, 4 sectors pulled per lane.
-            acc += nvhbi_ld1(&data[list[c] + 32u * lane]);
-            done += 4ull;
-            c += nwarps;
-            if (c >= r_count) c = (c >= 2u * r_count) ? (c % r_count) : (c - r_count);
-            if ((it & NVHBI_POLL_MASK) == NVHBI_POLL_MASK) {
-                if (r_prog && lane == 0u) { atomicAdd(r_prog, done * lanes); done = 0ull; }
-                if ((unsigned long long)(clock64() - t0) > deadline_cycles) break;
-                if (stop_flag && *(volatile const unsigned int*)stop_flag) break;
+            for (unsigned int it = 0; ; ++it) {
+                // byte 128*lane: 32 lanes cover the 32 lines of the 4KiB chunk,
+                // one instruction, 4 sectors pulled per lane.
+                acc += nvhbi_ld_stream(&data[list[r_first + c] + 32u * lane]);
+                done += 4ull;
+                c += nwarps;
+                if (c >= r_count) c = (c >= 2u * r_count) ? (c % r_count) : (c - r_count);
+                if ((it & NVHBI_POLL_MASK) == NVHBI_POLL_MASK) {
+                    if (r_prog && lane == 0u) { atomicAdd(r_prog, done * lanes); done = 0ull; }
+                    if ((unsigned long long)(clock64() - t0) > deadline_cycles) break;
+                    if (stop_flag && *(volatile const unsigned int*)stop_flag) break;
+                }
+            }
+        } else {
+#pragma unroll 1
+            for (unsigned int it = 0; ; ++it) {
+                acc += nvhbi_ld1(&data[list[r_first + c] + 32u * lane]);
+                done += 4ull;
+                c += nwarps;
+                if (c >= r_count) c = (c >= 2u * r_count) ? (c % r_count) : (c - r_count);
+                if ((it & NVHBI_POLL_MASK) == NVHBI_POLL_MASK) {
+                    if (r_prog && lane == 0u) { atomicAdd(r_prog, done * lanes); done = 0ull; }
+                    if ((unsigned long long)(clock64() - t0) > deadline_cycles) break;
+                    if (stop_flag && *(volatile const unsigned int*)stop_flag) break;
+                }
             }
         }
         if (r_prog && lane == 0u && done) atomicAdd(r_prog, done * lanes);
@@ -189,6 +214,20 @@ int main(int argc, char** argv) {
     const unsigned int window_ms = env_u("NVHBI_WINDOW_MS", 200u);
     const unsigned int repeat    = env_u("NVHBI_REPEAT", 3u);
     const unsigned int r_local   = env_u("NVHBI_R_LOCAL", 0u);
+    // Does the write target set need to BE in L2 at all? exp1 says probably
+    // not: fixing nvhbi_warm_chunks so it loads 100% of the range instead of
+    // 48.7% moved the cross-die write bandwidth by under 1.2%. If NVHBI_W_WARM=0
+    // reads the same as =1 here too, then the readers evicting the writers'
+    // lines cannot be what costs the writers 16%, and no amount of cache
+    // hinting will change the answer -- the cost is L2/fabric bandwidth, which
+    // is what we want to measure anyway. Run both before tuning hints.
+    const unsigned int w_warm    = env_u("NVHBI_W_WARM", 1u);
+    // L2 replacement hints. r_evict marks the streaming reads evict-first so
+    // they stop displacing everything; w_keep installs the write targets
+    // evict-last. Defaults ON -- they can only help -- but A/B them, because
+    // .cs/.cv were tried before and did nothing (see the note at the top).
+    const unsigned int r_evict   = env_u("NVHBI_R_EVICT", 1u);
+    const unsigned int w_keep    = env_u("NVHBI_W_KEEP", 1u);
     const double       buf_mult  = (double)env_u("NVHBI_BUF_MULT", 64u);
 
     unsigned int w_list[16], r_list[16];
@@ -208,21 +247,45 @@ int main(int argc, char** argv) {
     const unsigned int* d_wlist = (w_target_die == 1u) ? t.d_far_idx : t.d_near_idx;
     const unsigned int  r_avail = (r_source_die == 1u) ? t.far_count : t.near_count;
 
-    unsigned int r_chunks = env_u("NVHBI_R_CHUNKS", 0u);
-    if (!r_chunks || r_chunks > r_avail) r_chunks = r_avail;
-
     unsigned int w_max_chunks = 0;
     for (int i = 0; i < w_n; ++i)
         w_max_chunks = max(w_max_chunks, nvhbi_chunks_used(w_list[i], nbps, block, 1u));
 
+    // The crossing readers pull from the OTHER die, so they cannot collide with
+    // the writers' chunks; the local control shares a die with them and must be
+    // stepped past the write region.
+    const unsigned int r_first = r_local ? w_max_chunks : 0u;
+    unsigned int r_chunks = env_u("NVHBI_R_CHUNKS", 0u);
+    const unsigned int r_room = (r_avail > r_first) ? (r_avail - r_first) : 0u;
+    if (!r_chunks || r_chunks > r_room) r_chunks = r_room;
+    if (!r_chunks) { fprintf(stderr, "ERROR: no room for the read sweep\n"); return 1; }
+
+    // One wave, or the numbers are about the scheduler rather than the fabric:
+    // every block must be resident, since a second wave would start only after
+    // the first drained and would each run the full deadline.
+    if (block * nbps > 2048u || nbps > 32u) {
+        fprintf(stderr, "ERROR: %u threads x %u blocks/SM exceeds one resident wave "
+                        "(2048 threads and 32 block slots per SM)\n", block, nbps);
+        return 1;
+    }
+
     printf("die%u -> die%u direction, two payload sources, one fused kernel\n", wp, rp);
     printf("  writers: die%u SMs -> die%u L2,  %u chunks (%.1f MB), warmed\n",
            wp, w_target_die, w_max_chunks, w_max_chunks * 4096.0 / 1048576.0);
-    printf("  readers: die%u SMs <- die%u HBM, streaming %u chunks (%.1f MB = %.0fx per-die L2)%s\n",
-           rp, r_source_die, r_chunks, r_chunks * 4096.0 / 1048576.0,
+    printf("  readers: die%u SMs <- die%u HBM, streaming chunks [%u,%u) "
+           "(%.1f MB = %.0fx per-die L2)%s\n",
+           rp, r_source_die, r_first, r_first + r_chunks,
+           r_chunks * 4096.0 / 1048576.0,
            r_chunks * 4096.0 / (t.l2_bytes / 2.0),
            r_local ? "   [CONTROL: crosses nothing]" : "");
-    printf("# CFG,w_sms,r_sms,r_local,rep,write_GBps,read_GBps,total_GBps\n");
+    printf("  hints: write set warmed=%u evict_last=%u, reads evict_first=%u\n",
+           w_warm, w_keep, r_evict);
+    // dieB_GBps is everything arriving at die B's L2: the writes crossing into
+    // it plus, for a crossing read, the lines the reads fill into it. exp3's
+    // bg_local=1 point put a die's L2 write acceptance at ~4.88 TB/s, so this
+    // column says whether the pair is limited by the LINK or by the destination
+    // L2 -- the two explanations the write-only experiments cannot separate.
+    printf("# CFG,w_sms,r_sms,r_local,rep,write_GBps,read_GBps,total_GBps,dieB_GBps\n");
 
     cudaStream_t s;
     CHECK_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
@@ -243,8 +306,8 @@ int main(int argc, char** argv) {
             nvhbi_flush_l2(t);
             // Only the write targets are warmed. The read sweep is far larger
             // than L2 by construction, so it comes from the source die's HBM.
-            if (w_chunks) {
-                nvhbi_warm(t, d_wlist, 0u, w_chunks, w_target_die);
+            if (w_chunks && w_warm) {
+                nvhbi_warm(t, d_wlist, 0u, w_chunks, w_target_die, w_keep);
             }
             CHECK_CUDA(cudaDeviceSynchronize());
 
@@ -257,18 +320,21 @@ int main(int argc, char** argv) {
             nvhbi_dual<<<t.sm_count * nbps, block, 0, s>>>(
                 t.d_data, t.d_far_idx, t.d_near_idx, t.d_sm_side,
                 wp, w_sms, r_sms, r_local, nbps, (unsigned int)t.sm_count,
-                r_sms ? r_chunks : 0u, dl, stop.d, d_wprog, d_rprog, t.d_sink);
+                r_sms ? r_chunks : 0u, r_first, r_evict, dl, stop.d,
+                d_wprog, d_rprog, t.d_sink);
             CHECK_CUDA(cudaGetLastError());
             spin_ms(100.0);
 
+            // Stamp the clock immediately AFTER the copies land, at BOTH ends,
+            // so the same bias sits on each and cancels in the interval.
             unsigned long long w0 = 0, r0 = 0, w1 = 0, r1 = 0;
             CHECK_CUDA(cudaMemcpy(&w0, d_wprog, sizeof(w0), cudaMemcpyDeviceToHost));
             CHECK_CUDA(cudaMemcpy(&r0, d_rprog, sizeof(r0), cudaMemcpyDeviceToHost));
             const double t_start = now_ms();
-            spin_ms((double)window_ms);
-            const double wall = now_ms() - t_start;
+            while (now_ms() - t_start < (double)window_ms) { }
             CHECK_CUDA(cudaMemcpy(&w1, d_wprog, sizeof(w1), cudaMemcpyDeviceToHost));
             CHECK_CUDA(cudaMemcpy(&r1, d_rprog, sizeof(r1), cudaMemcpyDeviceToHost));
+            const double wall = now_ms() - t_start;
 
             nvhbi_stop_flag_set(stop);
             CHECK_CUDA(cudaStreamSynchronize(s));
@@ -277,8 +343,9 @@ int main(int argc, char** argv) {
             const double rg = (double)(r1 - r0) * 32.0 / (wall * 1e-3) / 1e9;
             // Both payloads travel die A -> die B, so for a crossing read the
             // sum is what that one direction carried.
-            printf("CFG,%u,%u,%u,%u,%.2f,%.2f,%.2f\n",
-                   w_sms, r_sms, r_local, rep, wg, rg, wg + (r_local ? 0.0 : rg));
+            printf("CFG,%u,%u,%u,%u,%.2f,%.2f,%.2f,%.2f\n",
+                   w_sms, r_sms, r_local, rep, wg, rg,
+                   wg + (r_local ? 0.0 : rg), wg + rg);
             fflush(stdout);
         }
     }}
