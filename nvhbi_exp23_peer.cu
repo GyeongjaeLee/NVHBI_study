@@ -315,8 +315,21 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaSetDevice(1));
         CHECK_CUDA(cudaMemset(d_peer_prog, 0, sizeof(unsigned long long)));
         const unsigned long long dl = (unsigned long long)window_ms * (unsigned long long)prop1_clock_khz;
+        // Same residency clamp the sweep uses. Without it this launched
+        // sm_count x 32 = 4736 blocks of 128 threads against a 16-blocks/SM
+        // occupancy limit -- exactly two waves. Each wave runs its own full
+        // deadline (the deadline is per-warp, from that warp's own t0), and the
+        // second wave's warps all have gwarp >= count so they spin without
+        // storing anything. The event span became 2 x window while the counter
+        // held one window's worth of stores, and this reported exactly half:
+        // 315.3 / 316.5 GB/s against the sweep's 631 / 633 on the same path.
+        const unsigned int cal_bps = resident_bps(128u, 32u);          // 16
+        unsigned int cal_pb = (unsigned int)prop1.multiProcessorCount * cal_bps;
+        const unsigned int cal_useful = cnt / 4u;                      // 4 warps/block
+        if (cal_useful && cal_pb > cal_useful) cal_pb = cal_useful;
+        if (!cal_pb) cal_pb = 1u;
         CHECK_CUDA(cudaEventRecord(pe0, s_peer));
-        nvhbi_peer_write<<<t.sm_count * 32, 128, 0, s_peer>>>(
+        nvhbi_peer_write<<<cal_pb, 128, 0, s_peer>>>(
             t.d_data, die_list1(die), 0u, cnt, 0u, dl, 0u, d_peer_prog, d_sink1);
         CHECK_CUDA(cudaEventRecord(pe1, s_peer));
         CHECK_CUDA(cudaStreamSynchronize(s_peer));
