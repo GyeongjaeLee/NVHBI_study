@@ -473,6 +473,7 @@ __global__ void nvhbi_dual(unsigned int* __restrict__ data,
                            const unsigned int* __restrict__ stop_flag,
                            unsigned long long* __restrict__ w_prog,
                            unsigned long long* __restrict__ r_prog,
+                           unsigned long long* __restrict__ cycles_out,
                            unsigned int* __restrict__ sink) {
     const unsigned int smid = nvhbi_smid();
     const unsigned int part = sm_side[smid] % 2u;
@@ -558,6 +559,10 @@ __global__ void nvhbi_dual(unsigned int* __restrict__ data,
         }
         if (r_prog && lane == 0u && done) atomicAdd(r_prog, done * lanes);
     }
+    // Longest loop span over the participating warps, so the caller can turn it
+    // into an achieved clock. Callers must zero *cycles_out first.
+    if (cycles_out && lane == 0u)
+        atomicMax(cycles_out, (unsigned long long)(clock64() - t0));
     nvhbi_st(&sink[smid], acc + (unsigned int)done);
 }
 

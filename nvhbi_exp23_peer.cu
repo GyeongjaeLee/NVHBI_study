@@ -50,6 +50,20 @@
 //                               it varies warps per block (1..4). One continuous
 //                               injection ramp from 32 threads to 4096.
 //      NVHBI_BG_LOCAL           1 = background stays on die A (control), default 0
+//      NVHBI_BG_R_SMS           crossing READS added to the background, issued by
+//                               the far die's SMs pulling from the near die --
+//                               same direction as the background writes and the
+//                               peer. A LIST, e.g. "0,8,16,32,64,76". 0 = the
+//                               write-only background. Needs NVHBI_BUF_MULT=64:
+//                               reads must stream over far more than L2 or the
+//                               reading die's replicas serve them and nothing
+//                               crosses. bg_sms=0 with readers gives read-alone
+//                               rows. Ignored for bg_local=1 (nvhbi_dual has no
+//                               own-die write mode, so that would not be a
+//                               control).
+//      NVHBI_HBM_PER_DIE_GBPS   plausibility bound on bg_rd_GBps, default 4000
+//                               (4 HBM3e stacks x ~1 TB/s). A read above it is
+//                               replicas being counted as crossings.
 //      NVHBI_WINDOW_MS          measurement window per point, default 200
 //      NVHBI_REPEAT             reps per point,               default 3
 //      NVHBI_PEER_CHUNKS        peer footprint in 4KiB chunks. 0 (default) sizes
@@ -122,7 +136,13 @@ int main(int argc, char** argv) {
     // Reads must stream over a footprint far larger than L2 or the requester
     // die's read-only replicas serve them and nothing crosses: run this with
     // NVHBI_BUF_MULT=64, not the default 8.
-    unsigned int bg_r_sms = env_u("NVHBI_BG_R_SMS", 0u);
+    // Swept, not a single value. A single point could not be reconciled against
+    // nvhbi_dualdir: at a nominal 16 readers dualdir reads 4260 GB/s of crossing
+    // traffic and this program read 3171 -- which is dualdir's 64-to-72 reader
+    // PLATEAU, not its 16-reader peak. The write-only baselines agree exactly
+    // (3440 both), so the writers are fine and the disagreement is on the read
+    // side. Sweeping, plus the read-alone rows that bg_sms=0 now produces,
+    // compares the two harnesses point by point instead of at one guess.
     const unsigned int window_ms = env_u("NVHBI_WINDOW_MS", 200u);
     const unsigned int repeat    = env_u("NVHBI_REPEAT", 3u);
     // How GPU1 pushes into GPU0:
@@ -158,8 +178,9 @@ int main(int argc, char** argv) {
     // and halves the reported bandwidth for a reason that has nothing to do with
     // the fabric.
     const unsigned int peer_nbps = env_u("NVHBI_PEER_BLOCKS_PER_SM", 32u);
-    unsigned int bg_list[32], bs_list[32];
+    unsigned int bg_list[32], bs_list[32], bgr_list[32];
     const int bg_n = parse_list("NVHBI_BG_SMS_LIST", "0,16,32,64,74", bg_list, 32);
+    const int bgr_n = parse_list("NVHBI_BG_R_SMS", "0", bgr_list, 32);
     const int bs_n = parse_list("NVHBI_PEER_BLOCK_SIZES",
                                 "0,1,2,4,8,16,32,64,128", bs_list, 32);
 
@@ -432,16 +453,6 @@ int main(int argc, char** argv) {
     }
     printf("=============================================\n\n");
 
-    // nvhbi_dual's writers always target the OTHER die -- it has no own-die
-    // mode -- so pairing readers with bg_local=1 would give a "control" whose
-    // writes still cross. Refuse rather than report a broken control.
-    if (bg_r_sms && bg_local) {
-        fprintf(stderr, "note: NVHBI_BG_R_SMS ignored for bg_local=1 -- the fused "
-                        "write+read background has no own-die write mode, so this "
-                        "row would not be a control\n");
-        bg_r_sms = 0u;
-    }
-
     /* -------- roles resolved -------- */
     const unsigned int peer_die = (exp == 2u) ? far_die : near_die;   // where GPU1 writes
     // Background is oriented A->B: writer SMs on die A (near), targeting die B (far).
@@ -486,64 +497,40 @@ int main(int argc, char** argv) {
        travels near->far: the same direction as the background's writes and as
        the peer. They must stream over far more than L2 or the far die's
        read-only replicas answer them and nothing crosses -- run with
-       NVHBI_BUF_MULT=64. Step past the peer region when the peer happens to
-       write into the die the readers are reading. */
+       NVHBI_BUF_MULT=64.
+
+       The offset is bg_reserve + 256, which is exactly what nvhbi_dualdir uses
+       (w_max_chunks + 256). Matching it is the point: the two harnesses must be
+       byte-for-byte the same experiment before their 34% disagreement can be
+       blamed on anything but the reader's starting position. */
+    unsigned int bg_r_max = 0;
+    for (int i = 0; i < bgr_n; ++i) if (bgr_list[i] > bg_r_max) bg_r_max = bgr_list[i];
     const unsigned int bg_r_src   = near_die;
-    const unsigned int bg_r_first = (peer_die == bg_r_src)
-                                  ? (peer_first + peer_chunks + 256u) : 0u;
+    const unsigned int bg_r_first = bg_reserve + 256u;
     const unsigned int bg_r_avail = die_count(bg_r_src);
     const unsigned int bg_r_chunks = (bg_r_avail > bg_r_first)
                                    ? (bg_r_avail - bg_r_first) : 0u;
-    if (bg_r_sms) {
+    // A read that lands above one die's HBM cannot be a real remote read; it is
+    // replicas on the reading die being counted as crossings. 4 HBM3e stacks per
+    // die at ~1 TB/s each is the ceiling to check against.
+    const double hbm_die_gbps = (double)env_u("NVHBI_HBM_PER_DIE_GBPS", 4000u);
+    if (bg_r_max) {
         if (!bg_r_chunks) {
             fprintf(stderr, "ERROR: no room for the background read sweep\n");
             return 1;
         }
         printf("  background reads: die%u SMs <- die%u, chunks [%u,%u) "
-               "(%.0f MB = %.0fx per-die L2)%s\n",
+               "(%.0f MB = %.0fx per-die L2), up to %u SMs\n",
                far_die, bg_r_src, bg_r_first, bg_r_first + bg_r_chunks,
                bg_r_chunks * (double)NVHBI_CHUNK_BYTES / 1048576.0,
-               bg_r_chunks * (double)NVHBI_CHUNK_BYTES / (t.l2_bytes / 2.0), "");
+               bg_r_chunks * (double)NVHBI_CHUNK_BYTES / (t.l2_bytes / 2.0),
+               bg_r_max);
         if (bg_r_chunks * (double)NVHBI_CHUNK_BYTES < 8.0 * (t.l2_bytes / 2.0))
             fprintf(stderr, "WARNING: the read sweep is only %.0fx a die's L2. Replicas on\n"
                             "         the reading die will serve most of it and little will\n"
                             "         cross. Raise NVHBI_BUF_MULT (64 is what dualdir uses).\n",
                     bg_r_chunks * (double)NVHBI_CHUNK_BYTES / (t.l2_bytes / 2.0));
     }
-
-    printf("exp%u: GPU1 --NVLink--> GPU0 die%u (%s)\n", exp, peer_die,
-           (exp == 2u) ? "FAR: crosses NV-HBI" : "NEAR: no NV-HBI hop");
-    printf("  background: die%u SMs -> die%u (%s), up to %u SMs\n",
-           bg_writer_partition, bg_target_die,
-           bg_local ? "OWN die = control" : "cross-die = bisection probe", bg_max);
-    printf("  peer region: chunks [%u,%u) on die%u -> %.1f MB%s\n",
-           peer_first, peer_first + peer_chunks, peer_die,
-           peer_chunks * (double)NVHBI_CHUNK_BYTES / (1024.0 * 1024.0),
-           peer_ovl ? "   [OVERLAPPING the background's chunks]" : "");
-    printf("  peer grid: %u blocks per SM x %d SMs, block size is the swept axis\n"
-           "             (below 32 it sets active lanes per warp = sectors per store\n"
-           "              instruction; above 32 it sets warps per block)\n",
-           peer_nbps, prop1.multiProcessorCount);
-    printf("  peer region sized %s: %u chunks for up to %u injecting warps"
-           " (%.0f%% of one die's L2)\n",
-           peer_chunks_auto ? "automatically" : "by NVHBI_PEER_CHUNKS",
-           peer_chunks, peer_warps_max,
-           100.0 * peer_chunks * NVHBI_CHUNK_BYTES / (t.l2_bytes / 2.0));
-    {
-        // What die `peer_die` has to hold: the background's reserved chunks (when
-        // it targets the same die) plus the peer region that sits after them.
-        const double used = (double)(peer_first + peer_chunks) * NVHBI_CHUNK_BYTES;
-        const double die_l2 = t.l2_bytes / 2.0;
-        printf("  die%u L2 footprint: %.1f MB of %.1f MB (%.0f%%)\n\n",
-               peer_die, used / 1048576.0, die_l2 / 1048576.0, 100.0 * used / die_l2);
-        if (used > 0.8 * die_l2)
-            fprintf(stderr, "WARNING: background + peer need %.0f%% of die%u's L2. Not all of\n"
-                            "         it stays resident, so some writes miss to HBM and the\n"
-                            "         numbers stop being pure remote-L2 traffic. Lower\n"
-                            "         NVHBI_PEER_BLOCKS_PER_SM or NVHBI_PEER_CHUNKS.\n",
-                    100.0 * used / die_l2, peer_die);
-    }
-    printf("  peer stores: %u idle cycles per store group\n", peer_idle);
 
     /* -------- background machinery on GPU0 -------- */
     if (peer_mode == 1u) {
@@ -651,10 +638,20 @@ int main(int argc, char** argv) {
            "bg_rd_GBps,bg_r_sms\n");
 
     for (int bi = 0; bi < bg_n; ++bi) {
+    for (int ri = 0; ri < bgr_n; ++ri) {
     for (int pi = 0; pi < bs_n; ++pi) {
-        const unsigned int bg_sms      = bg_list[bi];
+        const unsigned int bg_sms  = bg_list[bi];
         const unsigned int peer_bs = bs_list[pi];
-        if (bg_sms == 0u && peer_bs == 0u) continue;
+        // nvhbi_dual's writers always target the OTHER die -- it has no own-die
+        // mode -- so readers paired with bg_local=1 would give a "control" whose
+        // writes still cross. Skip rather than report a broken control.
+        if (bg_local && bgr_list[ri]) continue;
+        const unsigned int bg_r_sms = bgr_list[ri];
+        // bg_sms=0 with readers is a READ-ALONE row, and it is the row that
+        // reconciles this program against nvhbi_dualdir's w=0 series. It used to
+        // be impossible because the launch was gated on bg_sms alone.
+        const bool bg_on = (bg_sms != 0u) || (bg_r_sms != 0u);
+        if (!bg_on && peer_bs == 0u) continue;
         const unsigned int bg_chunks = bg_sms
             ? nvhbi_chunks_used(bg_sms, bg_nbps, bg_block, bg_lines) : 0u;
 
@@ -678,7 +675,7 @@ int main(int argc, char** argv) {
             CHECK_CUDA(cudaMemset(d_bg_rprog, 0, sizeof(unsigned long long)));
             CHECK_CUDA(cudaMemset(d_bg_cyc, 0, sizeof(unsigned long long)));
             nvhbi_stop_flag_reset(stop);
-            if (bg_sms) {
+            if (bg_on) {
                 // Must outlast settle + the whole peer kernel, or the counter
                 // delta gets divided by a window the background was not alive
                 // for. That artifact produced the fake "bg dropped to 120 GB/s"
@@ -691,9 +688,10 @@ int main(int argc, char** argv) {
                     nvhbi_dual<<<t.sm_count * bg_nbps, bg_block, 0, s_bg>>>(
                         t.d_data, t.d_far_idx, t.d_near_idx, t.d_sm_side,
                         bg_writer_partition, bg_sms, bg_r_sms, /*r_local=*/0u, bg_nbps,
-                        (unsigned int)t.sm_count, bg_r_chunks, bg_r_first,
+                        (unsigned int)t.sm_count,
+                        bg_r_sms ? bg_r_chunks : 0u, bg_r_first,
                         /*r_evict_first=*/1u, dl, stop.d,
-                        d_bg_prog, d_bg_rprog, t.d_sink);
+                        d_bg_prog, d_bg_rprog, d_bg_cyc, t.d_sink);
                 } else {
                     nvhbi_stress_write<<<t.sm_count * bg_nbps, bg_block, 0, s_bg>>>(
                         t.d_data, t.d_far_idx, t.d_near_idx, t.d_sm_side,
@@ -710,7 +708,7 @@ int main(int argc, char** argv) {
             unsigned long long bg_p0 = 0, bg_p1 = 0, peer_stores = 0;
             unsigned long long bg_r0 = 0, bg_r1 = 0;
             CHECK_CUDA(cudaMemcpy(&bg_p0, d_bg_prog, sizeof(bg_p0), cudaMemcpyDeviceToHost));
-            if (bg_r_sms)
+            if (bg_on)
                 CHECK_CUDA(cudaMemcpy(&bg_r0, d_bg_rprog, sizeof(bg_r0), cudaMemcpyDeviceToHost));
             // Clamp the peer grid. Two ways it silently broke the sweep before:
             //  * more blocks than fit resident -> each WAVE runs the full deadline,
@@ -782,10 +780,10 @@ int main(int argc, char** argv) {
 
             CHECK_CUDA(cudaSetDevice(0));
             CHECK_CUDA(cudaMemcpy(&bg_p1, d_bg_prog, sizeof(bg_p1), cudaMemcpyDeviceToHost));
-            if (bg_r_sms)
+            if (bg_on)
                 CHECK_CUDA(cudaMemcpy(&bg_r1, d_bg_rprog, sizeof(bg_r1), cudaMemcpyDeviceToHost));
             unsigned long long bg_cyc = 0ull;
-            if (bg_sms) {
+            if (bg_on) {
                 nvhbi_stop_flag_set(stop);
                 CHECK_CUDA(cudaStreamSynchronize(s_bg));
                 CHECK_CUDA(cudaMemcpy(&bg_cyc, d_bg_cyc, sizeof(bg_cyc),
@@ -797,11 +795,11 @@ int main(int argc, char** argv) {
             // this. (With NVHBI_POLL_MASK=65535 the overrun reached ~267 ms
             // against an assumed 300 ms span and reported 2.1 GHz.)
             const double bg_span_ms = (bg_launch_ms > 0.0) ? (now_ms() - bg_launch_ms) : 0.0;
-            const double bg_ghz = (bg_sms && bg_cyc && bg_span_ms > 0.0)
+            const double bg_ghz = (bg_on && bg_cyc && bg_span_ms > 0.0)
                 ? (double)bg_cyc / (bg_span_ms * 1e6) : 0.0;
 
             const double bg_alive_ms = (double)(4u * window_ms + 2000u) - 100.0;
-            if (bg_sms && wall_ms > bg_alive_ms)
+            if (bg_on && wall_ms > bg_alive_ms)
                 fprintf(stderr, "WARNING: peer ran %.0f ms but background deadline was %.0f ms "
                                 "-- bg_GBps is understated\n", wall_ms, bg_alive_ms);
 
@@ -832,9 +830,9 @@ int main(int argc, char** argv) {
 
             const double peer_gbps = (peer_ms > 0.f)
                 ? (double)peer_stores * 32.0 / (peer_ms * 1e-3) / 1e9 : 0.0;
-            const double bg_gbps = (bg_sms && wall_ms > 0.0)
+            const double bg_gbps = (bg_on && wall_ms > 0.0)
                 ? (double)(bg_p1 - bg_p0) * 32.0 / (wall_ms * 1e-3) / 1e9 : 0.0;
-            const double bg_rd_gbps = (bg_r_sms && wall_ms > 0.0)
+            const double bg_rd_gbps = (bg_on && wall_ms > 0.0)
                 ? (double)(bg_r1 - bg_r0) * 32.0 / (wall_ms * 1e-3) / 1e9 : 0.0;
             // Everything the near->far direction is carrying: the background's
             // writes, its crossing reads, and the peer when it targets the far
@@ -842,6 +840,12 @@ int main(int argc, char** argv) {
             const double crossing = (bg_local ? 0.0 : bg_gbps + bg_rd_gbps)
                                   + ((exp == 2u) ? peer_gbps : 0.0);
 
+            if (bg_rd_gbps > hbm_die_gbps)
+                fprintf(stderr, "WARNING: bg read reads %.0f GB/s from one die, above the %.0f GB/s\n"
+                                "         that die's HBM stacks can supply. Some of it is being\n"
+                                "         served by replicas on the reading die and counted as\n"
+                                "         crossing traffic -- do not quote this number.\n",
+                        bg_rd_gbps, hbm_die_gbps);
             printf("CFG,%u,%u,%u,%u,%u,%u,%u,%.4f,%.2f,%.2f,%.2f,%.3f,%u,%u,%.2f,%u\n",
                    exp, far_die, peer_die, bg_local, bg_sms,
                    peer_bs ? pb : 0u, rep,
@@ -849,7 +853,7 @@ int main(int argc, char** argv) {
                    peer_ovl ? 1u : 0u, peer_bs, bg_rd_gbps, bg_r_sms);
             fflush(stdout);
         }
-    }}
+    }}}
 
     CHECK_CUDA(cudaSetDevice(1));
     CHECK_CUDA(cudaEventDestroy(pe0)); CHECK_CUDA(cudaEventDestroy(pe1));

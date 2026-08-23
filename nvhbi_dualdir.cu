@@ -267,7 +267,7 @@ int main(int argc, char** argv) {
                 t.d_data, t.d_far_idx, t.d_near_idx, t.d_sm_side,
                 wp, w_sms, r_sms, r_local, nbps, (unsigned int)t.sm_count,
                 r_sms ? r_chunks : 0u, r_first, r_evict, dl, stop.d,
-                d_wprog, d_rprog, t.d_sink);
+                d_wprog, d_rprog, nullptr, t.d_sink);
             CHECK_CUDA(cudaGetLastError());
             spin_ms(100.0);
 
